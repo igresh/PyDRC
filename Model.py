@@ -26,7 +26,8 @@ class Surface(object):
                  longitude=151.2093,
                  thickness=8e-4,
                  spec_heat_cap=890,
-                 density=2710):
+                 density=2710,
+                 convection_model='Maestre-Valero'):
 
         self.solar_reflectivity = solar_reflectivity
         self.spectral_absorptivity = spectral_absorptivity
@@ -40,6 +41,7 @@ class Surface(object):
         self.spec_heat_cap = spec_heat_cap
         self.density = density
         self._sky_view_factor = sky_view_factor
+        self.convection_model = convection_model
 
     @property
     def sky_view_factor(self):
@@ -89,7 +91,7 @@ class SurfaceSimulator(object):
         irrad = self.interp_Psolar(t)
 
         heat_cap_surf = 1/(self.surface.heat_cap_per_m2+condensed_mass*self.heatcap_water)
-        cond_rate = deriv_m(Tamb,humidity,Tsurf,windspeed,pressure)
+        cond_rate = deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model)
         dmdt = cond_rate-0.01*condensed_mass #I think this is just hacking in an evaporation rate?
         dcdt = 0.01*condensed_mass # c represents cumulative evaporated mass
 
@@ -100,7 +102,7 @@ class SurfaceSimulator(object):
 
         dTdt =  heat_cap_surf*heat_balance_equation(Tsurf_guess=[Tsurf], Tamb=Tamb, irradiance=irrad, humidity=humidity, windspeed=windspeed,
                                                            reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
-                                                           cond_rate=cond_rate)
+                                                           cond_rate=cond_rate, model=self.surface.convection_model)
         return [dmdt,dTdt,dcdt]
 
     def solve(self):
@@ -132,7 +134,7 @@ class SurfaceSimulator(object):
             pressure = self.interp_pres(t)
             windspeed = self.interp_wspd(t)
             humidity = self.interp_Humid(t)
-            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure))
+            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model))
         sim_df['Theory - cond rate'] = np.array(cond_rates)
 
         # Cumulative condensation is the current condensed mass plus cumulative evaporated mass
@@ -185,7 +187,7 @@ class equil_solver(object):
             Tc_equilibrium, = fsolve(
                 heat_balance_equation,
                 x0=initial_guess,
-                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover)
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model)
             )
             Tsurfs.append(Tc_equilibrium)
         GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
@@ -220,34 +222,79 @@ def make_dataframe(df_section, surface):
 
 ## -----------
 
-def conv_heat_transfer_coeff(T_surface, windspeed, model='Maestre-Valero'):
+def get_tarp_natural_convection(T_surface, T_ambient, tilt):
     """
-    Surface temp in Celsius (which is converted to Kelvin in the equations)
-    Wind speed in m/s
+    Computes natural convection heat transfer coefficient using George N. Walton (1983) model.
+    T_surface and T_ambient are in Celsius, tilt is in degrees.
+    """
+    delta_T = T_surface - T_ambient
+    abs_delta_T = abs(delta_T)
+    if abs_delta_T < 1e-5:
+        return 0.0
+    
+    theta = np.deg2rad(tilt)
+    cos_theta = np.cos(theta)
+    abs_cos_theta = abs(cos_theta)
+    
+    # Determine stable/unstable conditions
+    # For upward-facing panels (tilt <= 90), unstable if T_surface > T_ambient
+    # For downward-facing panels (tilt > 90), unstable if T_surface < T_ambient
+    is_upward = (tilt <= 90.0)
+    is_heating = (delta_T > 0.0)
+    
+    if (is_upward and is_heating) or (not is_upward and not is_heating):
+        # Unstable flow (buoyancy enhances heat transfer)
+        h_nat = 9.482 * (abs_delta_T ** (1/3)) / (7.283 - abs_cos_theta)
+    else:
+        # Stable flow (buoyancy suppresses heat transfer)
+        h_nat = 1.810 * (abs_delta_T ** (1/3)) / (1.382 + abs_cos_theta)
+        
+    return h_nat
 
-    These heat transfer functions have a significant impact on the theoretical predictions.
-    Maestre-Valero appears to be estimated for similar conditions, and provides a reasonable fit to the data.
-    However, these functional relationships should really be established by experiment for a particular set up.
+def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, model='Maestre-Valero'):
+    """
+    Calculates convective heat transfer coefficient.
+    T_surface: Surface temperature in Celsius
+    windspeed: Wind speed in m/s
+    T_ambient: Ambient air temperature in Celsius (optional, required for Combined-TARP models)
+    tilt: Panel tilt angle in degrees (optional, required for Combined-TARP models)
     """
     if model == 'Maestre-Valero':
-        # Added + 273.15 to convert Celsius to Kelvin
-        return 7.6 + 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)  # Maestre-Valero (2011)
-    elif model == 'Sharples':
-        return 8+2.5*windspeed#*(511+294)/(511+Ta+273.15) #Sharples? (1998)
+        T_ref = T_ambient if T_ambient is not None else T_surface
+        return 7.6 + 6.6 * windspeed * (511 + 294) / (511 + T_ref + 273.15)
     elif model == 'Richards':
-        return 5.9+4.1*windspeed*(511+294)/(511+T_surface+273.15) #Richards (2009)
+        T_ref = T_ambient if T_ambient is not None else T_surface
+        return 5.9 + 4.1 * windspeed * (511 + 294) / (511 + T_ref + 273.15)
+    elif model == 'Sharples':
+        return 8 + 2.5 * windspeed
+        
+    # TARP models (combination of natural + forced component)
+    if T_ambient is None:
+        h_nat = 0.0
     else:
-        raise ValueError('Unknown model')
+        h_nat = get_tarp_natural_convection(T_surface, T_ambient, tilt)
+        
+    if model == 'Combined-TARP-Maestre':
+        return h_nat + 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+    elif model == 'Combined-TARP-Richards':
+        return h_nat + 4.1 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+    elif model == 'Combined-TARP-Sharples':
+        return h_nat + 2.5 * windspeed
+    else:
+        raise ValueError(f'Unknown model: {model}')
 
-def Pconvection(T_amb, T_surf, windspeed):
-    return conv_heat_transfer_coeff(T_amb, windspeed) * (T_amb - T_surf)
+def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero'):
+    # Note that in heat balance, T_surf is surface temp and T_amb is ambient temp
+    hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model)
+    return hc * (T_amb - T_surf)
 
-def deriv_m(T_amb, H, T_surf, windspeed, p):
+def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero'):
     Ca = 1005
 
     Tdew = Tdewpoint(T_amb, H)
     if T_surf <= Tdew:
-        val = ((conv_heat_transfer_coeff(T_amb, windspeed) * 0.622) / (Ca * p)) * (VPsat(Tdew) - VPsat(T_surf))
+        hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model)
+        val = ((hc * 0.622) / (Ca * p)) * (VPsat(Tdew) - VPsat(T_surf))
     else:
         val = 0
     return val
@@ -429,7 +476,7 @@ class ThermalHeatTransfer (object):
 
 
 
-def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0):
+def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero'):
     """
     The objective function that we want to equal zero.
     Calculates the net heat flux for a given guess of surface temperature (Tc_guess).
@@ -439,7 +486,8 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
     # Calculate individual heat fluxes
     P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover)
     P_sol = (1 - reflectivity) * irradiance
-    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed)
+    tilt = radht.surface.tilt if (hasattr(radht, 'surface') and radht.surface is not None) else 0.0
+    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model)
     P_lat = Lv * cond_rate # 0, unless condensation rate provided
 
     # print (f'LWIR out: {P_out:.1f}, LWIR in: {P_inc:.1f}, solar: {P_sol:.1f}')
