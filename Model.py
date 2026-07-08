@@ -27,7 +27,8 @@ class Surface(object):
                  thickness=8e-4,
                  spec_heat_cap=890,
                  density=2710,
-                 convection_model='Maestre-Valero'):
+                 convection_model='Maestre-Valero',
+                 char_length=None):
 
         self.solar_reflectivity = solar_reflectivity
         self.spectral_absorptivity = spectral_absorptivity
@@ -42,6 +43,7 @@ class Surface(object):
         self.density = density
         self._sky_view_factor = sky_view_factor
         self.convection_model = convection_model
+        self.char_length = char_length
 
     @property
     def sky_view_factor(self):
@@ -91,7 +93,7 @@ class SurfaceSimulator(object):
         irrad = self.interp_Psolar(t)
 
         heat_cap_surf = 1/(self.surface.heat_cap_per_m2+condensed_mass*self.heatcap_water)
-        cond_rate = deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model)
+        cond_rate = deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length)
         dmdt = cond_rate-0.01*condensed_mass #I think this is just hacking in an evaporation rate?
         dcdt = 0.01*condensed_mass # c represents cumulative evaporated mass
 
@@ -102,7 +104,7 @@ class SurfaceSimulator(object):
 
         dTdt =  heat_cap_surf*heat_balance_equation(Tsurf_guess=[Tsurf], Tamb=Tamb, irradiance=irrad, humidity=humidity, windspeed=windspeed,
                                                            reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
-                                                           cond_rate=cond_rate, model=self.surface.convection_model)
+                                                           cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length)
         return [dmdt,dTdt,dcdt]
 
     def solve(self):
@@ -134,7 +136,7 @@ class SurfaceSimulator(object):
             pressure = self.interp_pres(t)
             windspeed = self.interp_wspd(t)
             humidity = self.interp_Humid(t)
-            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model))
+            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length))
         sim_df['Theory - cond rate'] = np.array(cond_rates)
 
         # Cumulative condensation is the current condensed mass plus cumulative evaporated mass
@@ -143,6 +145,8 @@ class SurfaceSimulator(object):
         return sim_df
 
 def calculate_plane_of_array_irradiance(surface, times, exp_ghi):
+    # Would be nice to have a way to account for the loss of dhi due to surrounding buildings etc
+    # raising the horizon.
     solar_pos = pvlib.solarposition.get_solarposition(time=times, latitude=surface.latitude, longitude=surface.longitude)
     dni_extra = pvlib.irradiance.get_extra_radiation(times)
     erbs = pvlib.irradiance.erbs(exp_ghi, solar_pos['zenith'], times)
@@ -156,7 +160,7 @@ def calculate_plane_of_array_irradiance(surface, times, exp_ghi):
             ghi=exp_ghi,
             dhi=erbs['dhi'],
             dni_extra=dni_extra,
-            model='isotropic',
+            model='perez-driesse',
             albedo=surface.surrounds_albedo
             )['poa_global']
 
@@ -187,7 +191,7 @@ class equil_solver(object):
             Tc_equilibrium, = fsolve(
                 heat_balance_equation,
                 x0=initial_guess,
-                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model)
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length)
             )
             Tsurfs.append(Tc_equilibrium)
         GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
@@ -221,11 +225,12 @@ def make_dataframe(df_section, surface):
     return new_df
 
 ## -----------
-
-def get_tarp_natural_convection(T_surface, T_ambient, tilt):
+def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
     """
-    Computes natural convection heat transfer coefficient using George N. Walton (1983) model.
-    T_surface and T_ambient are in Celsius, tilt is in degrees.
+    Computes natural convection heat transfer coefficient.
+    If char_length is provided, uses size-dependent McAdams/ASHRAE correlations.
+    Otherwise, defaults to the size-independent George N. Walton (1983) model.
+    T_surface and T_ambient are in Celsius, tilt is in degrees, char_length in meters.
     """
     delta_T = T_surface - T_ambient
     abs_delta_T = abs(delta_T)
@@ -236,28 +241,51 @@ def get_tarp_natural_convection(T_surface, T_ambient, tilt):
     cos_theta = np.cos(theta)
     abs_cos_theta = abs(cos_theta)
     
-    # Determine stable/unstable conditions
-    # For upward-facing panels (tilt <= 90), unstable if T_surface > T_ambient
-    # For downward-facing panels (tilt > 90), unstable if T_surface < T_ambient
     is_upward = (tilt <= 90.0)
     is_heating = (delta_T > 0.0)
+    is_unstable = (is_upward and is_heating) or (not is_upward and not is_heating)
     
-    if (is_upward and is_heating) or (not is_upward and not is_heating):
-        # Unstable flow (buoyancy enhances heat transfer)
-        h_nat = 9.482 * (abs_delta_T ** (1/3)) / (7.283 - abs_cos_theta)
+    if char_length is not None and char_length > 0.0:
+        # Size-dependent natural convection based on Rayleigh number
+        # Ra_L = g * beta * delta_T * L^3 / (nu * alpha)
+        # Approximate scaling factor for air at standard temperature: 1.6e8
+        Ra_L = 1.6e8 * abs_delta_T * (char_length ** 3)
+        
+        # Horizontal plate component
+        if is_unstable:
+            if Ra_L < 1e7:
+                h_nat_horiz = 1.32 * ((abs_delta_T / char_length) ** 0.25)
+            else:
+                h_nat_horiz = 1.52 * (abs_delta_T ** (1/3))
+        else:
+            h_nat_horiz = 0.59 * ((abs_delta_T / char_length) ** 0.25)
+            
+        # Vertical plate component
+        if Ra_L < 1e9:
+            h_nat_vert = 1.42 * ((abs_delta_T / char_length) ** 0.25)
+        else:
+            h_nat_vert = 1.31 * (abs_delta_T ** (1/3))
+            
+        # Interpolate based on tilt angle
+        sin_theta = np.sin(theta)
+        h_nat = h_nat_horiz * abs_cos_theta + h_nat_vert * abs(sin_theta)
     else:
-        # Stable flow (buoyancy suppresses heat transfer)
-        h_nat = 1.810 * (abs_delta_T ** (1/3)) / (1.382 + abs_cos_theta)
+        # Size-independent Walton model
+        if is_unstable:
+            h_nat = 9.482 * (abs_delta_T ** (1/3)) / (7.283 - abs_cos_theta)
+        else:
+            h_nat = 1.810 * (abs_delta_T ** (1/3)) / (1.382 + abs_cos_theta)
         
     return h_nat
 
-def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, model='Maestre-Valero'):
+def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, model='Maestre-Valero', char_length=None):
     """
     Calculates convective heat transfer coefficient.
     T_surface: Surface temperature in Celsius
     windspeed: Wind speed in m/s
     T_ambient: Ambient air temperature in Celsius (optional, required for Combined-TARP models)
     tilt: Panel tilt angle in degrees (optional, required for Combined-TARP models)
+    char_length: Characteristic length L = As/P in meters (optional, triggers size-dependent scaling)
     """
     if model == 'Maestre-Valero':
         T_ref = T_ambient if T_ambient is not None else T_surface
@@ -268,32 +296,46 @@ def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, mod
     elif model == 'Sharples':
         return 8 + 2.5 * windspeed
         
-    # TARP models (combination of natural + forced component)
+    # TARP/Combined models (combination of natural + forced component)
     if T_ambient is None:
         h_nat = 0.0
     else:
-        h_nat = get_tarp_natural_convection(T_surface, T_ambient, tilt)
+        h_nat = get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=char_length)
         
+    # Scale forced components by (L_ref / L)^0.5
+    # The reference length L_ref corresponds to the characteristic length of the panels in the base study.
+    # Maestre-Valero: 1.0 m square foils -> L_ref = As/P = 0.25 m
+    # Richards / Sharples: building roofs / large walls -> L_ref = 1.0 m
     if model == 'Combined-TARP-Maestre':
-        return h_nat + 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+        L_ref = 0.25
+        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_term = 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+        return h_nat + forced_term * forced_scale
     elif model == 'Combined-TARP-Richards':
-        return h_nat + 4.1 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+        L_ref = 1.0
+        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_term = 4.1 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
+        return h_nat + forced_term * forced_scale
     elif model == 'Combined-TARP-Sharples':
-        return h_nat + 2.5 * windspeed
+        # Sharples (1998) used a 1.8m x 0.9m flat plate solar collector.
+        # For a 1.8m x 0.9m panel: L_ref = As/P = (1.8 * 0.9) / (2 * (1.8 + 0.9)) = 0.3 m.
+        L_ref = 0.3
+        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_term = 2.5 * windspeed
+        return h_nat + forced_term * forced_scale
     else:
         raise ValueError(f'Unknown model: {model}')
 
-def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero'):
-    # Note that in heat balance, T_surf is surface temp and T_amb is ambient temp
-    hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model)
+def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero', char_length=None):
+    hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length)
     return hc * (T_amb - T_surf)
 
-def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero'):
+def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero', char_length=None):
     Ca = 1005
 
     Tdew = Tdewpoint(T_amb, H)
     if T_surf <= Tdew:
-        hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model)
+        hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length)
         val = ((hc * 0.622) / (Ca * p)) * (VPsat(Tdew) - VPsat(T_surf))
     else:
         val = 0
@@ -318,6 +360,8 @@ def Tdewpoint(T_amb, humidity):
 
 def planck_law(wavelength, T_kelvin):
     """
+    Wavelength in meters
+    Temperature in Kelvin
     Calculates the spectral radiant exitance of a blackbody.
     Returns power per unit area per unit wavelength (W/m^3).
     """
@@ -476,7 +520,7 @@ class ThermalHeatTransfer (object):
 
 
 
-def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero'):
+def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None):
     """
     The objective function that we want to equal zero.
     Calculates the net heat flux for a given guess of surface temperature (Tc_guess).
@@ -487,7 +531,7 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
     P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover)
     P_sol = (1 - reflectivity) * irradiance
     tilt = radht.surface.tilt if (hasattr(radht, 'surface') and radht.surface is not None) else 0.0
-    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model)
+    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model, char_length=char_length)
     P_lat = Lv * cond_rate # 0, unless condensation rate provided
 
     # print (f'LWIR out: {P_out:.1f}, LWIR in: {P_inc:.1f}, solar: {P_sol:.1f}')
