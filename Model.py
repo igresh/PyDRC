@@ -28,7 +28,19 @@ class Surface(object):
                  spec_heat_cap=890,
                  density=2710,
                  convection_model='Maestre-Valero',
-                 char_length=None):
+                 char_length=None,
+                 back_conductance=0.0,
+                 insulation_conductivity=None,
+                 insulation_thickness=None,
+                 ground_h_eff=None,
+                 ground_emissivity=0.95):
+        """
+        ground_h_eff (float or None): effective heat transfer coefficient of the surrounding ground,
+            W/(m^2 K). Enables the GHI-driven ground temperature model (typ. 25-35 for concrete/paving).
+            If None, the surroundings are assumed to be at ambient air temperature.
+        ground_emissivity (float): broadband LWIR emissivity of the ground (typ. 0.90-0.97).
+            The ground's solar albedo is taken from surrounds_albedo.
+        """
 
         self.solar_reflectivity = solar_reflectivity
         self.spectral_absorptivity = spectral_absorptivity
@@ -44,13 +56,30 @@ class Surface(object):
         self._sky_view_factor = sky_view_factor
         self.convection_model = convection_model
         self.char_length = char_length
+        self._back_conductance = back_conductance
+        self.insulation_conductivity = insulation_conductivity
+        self.insulation_thickness = insulation_thickness
+        self.ground_h_eff = ground_h_eff
+        self.ground_emissivity = ground_emissivity
+
+    @property
+    def back_conductance(self):
+        if self.insulation_conductivity is not None and self.insulation_thickness is not None and self.insulation_thickness > 0:
+            return self.insulation_conductivity / self.insulation_thickness
+        return self._back_conductance
+
+    @back_conductance.setter
+    def back_conductance(self, value):
+        self._back_conductance = value
 
     @property
     def sky_view_factor(self):
         if self._sky_view_factor is not None:
             return self._sky_view_factor
         else:
-            return np.cos(np.deg2rad(self.tilt))
+            # Isotropic view factor from a tilted plane to the sky hemisphere,
+            # assuming an unobstructed horizon over flat ground: F_sky = (1 + cos β) / 2
+            return (1 + np.cos(np.deg2rad(self.tilt))) / 2
 
     @property
     def heat_cap_per_m2(self):
@@ -74,11 +103,16 @@ class SurfaceSimulator(object):
         self.interp_pres = self.create_interpolator('Barometric pressure, kPa')
         self.interp_Psolar = self.create_interpolator('irradiance on tilted panels')
         self.interp_cloud = self.create_interpolator('Cloud cover')
+        # GHI is used for the ground-temperature model; optional for backwards compatibility
+        self.interp_GHI = self.create_interpolator('GHI') if 'GHI' in self.exp_df.columns else None
 
         self.heatcap_water = 4184
 
     def create_interpolator(self, name):
         return interp1d(self.exp_df['Time, s'], self.exp_df[name], kind='linear', bounds_error=False, fill_value=(self.exp_df[name].iloc[0], self.exp_df[name].iloc[-1]))
+
+    def _ghi(self, t):
+        return float(self.interp_GHI(t)) if self.interp_GHI is not None else None
 
     def _derivs(self, t, Y):
         # Physically, condensed mass cannot be negative
@@ -104,7 +138,9 @@ class SurfaceSimulator(object):
 
         dTdt =  heat_cap_surf*heat_balance_equation(Tsurf_guess=[Tsurf], Tamb=Tamb, irradiance=irrad, humidity=humidity, windspeed=windspeed,
                                                            reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
-                                                           cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length)
+                                                           cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length,
+                                                           back_conductance=getattr(self.surface, 'back_conductance', 0.0),
+                                                           ghi=self._ghi(t))
         return [dmdt,dTdt,dcdt]
 
     def solve(self):
@@ -138,6 +174,14 @@ class SurfaceSimulator(object):
             humidity = self.interp_Humid(t)
             cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length))
         sim_df['Theory - cond rate'] = np.array(cond_rates)
+
+        # Modelled ground temperature (equals Tamb if ground_h_eff is None or GHI unavailable)
+        sim_df['Theory - Tground'] = [
+            self.Prad_function.ground_temperature(float(self.interp_Tamb(t)), ghi=self._ghi(t),
+                                                  humidity=float(self.interp_Humid(t)),
+                                                  cloud_cover=float(self.interp_cloud(t)))
+            for t in t_exp
+        ]
 
         # Cumulative condensation is the current condensed mass plus cumulative evaporated mass
         sim_df['Theory - cumulative condensation'] = sim_df['Theory - condensed_mass'] + sim_df['Theory - c']
@@ -181,7 +225,7 @@ class equil_solver(object):
         self.surface.spectral_absorptivity.SWIRemm = 1-reflectivity
         self.radht.update_surface_cache()
 
-        ghi_basis = np.linspace(0,1100,11)
+        ghi_basis = np.linspace(0,1300,13)
         Tsurfs = []
         initial_guess = [self.Tamb]
 
@@ -191,7 +235,30 @@ class equil_solver(object):
             Tc_equilibrium, = fsolve(
                 heat_balance_equation,
                 x0=initial_guess,
-                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length)
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi)
+            )
+            Tsurfs.append(Tc_equilibrium)
+        GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
+
+        return GHI_interp(ghi) - self.Tamb
+
+    def T_ghi_LWIRemm(self, ghi, reflectivity, LWIRemm):
+        self.surface.solar_reflectivity = reflectivity
+        self.surface.spectral_absorptivity.LWIRemm = LWIRemm
+        self.surface.spectral_absorptivity.SWIRemm = 1-reflectivity
+        self.radht.update_surface_cache()
+
+        ghi_basis = np.linspace(0,1300,13)
+        Tsurfs = []
+        initial_guess = [self.Tamb]
+
+        # Step 2: Use fsolve to find the exact Tc that makes the heat_balance_equation return 0.
+        # We pass all the environmental variables through the 'args' tuple.
+        for i_ghi in ghi_basis:
+            Tc_equilibrium, = fsolve(
+                heat_balance_equation,
+                x0=initial_guess,
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi)
             )
             Tsurfs.append(Tc_equilibrium)
         GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
@@ -206,7 +273,7 @@ def make_dataframe(df_section, surface):
     new_df = pd.DataFrame(index=df_section.index)
     new_df['Time, s'] = (df_section.index - df_section.index[0]).total_seconds()
     new_df['Barometric pressure, kPa'] = 0.1*df_section[('General', 'Barometric pressure, mbar')]
-    new_df['Tsurf'] = (df_section[(surface.name, 'Temp 1')] + df_section[(surface.name, 'Temp 2')])/2
+    new_df['Tsurf'] = df_section[(surface.name, 'Temp avg delta')] + df_section[('General', 'Air temp, ˚C')]
     new_df['Tamb'] = df_section[('General', 'Air temp, ˚C')]
     new_df['Humidity'] = df_section[('General', 'RH, %')]
     new_df['Windspeed'] = df_section[('General', 'Windspeed, m/s')]
@@ -329,6 +396,14 @@ def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, mod
 def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero', char_length=None):
     hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length)
     return hc * (T_amb - T_surf)
+
+def Pconduction(T_amb, T_surf, back_conductance=0.0):
+    """
+    Calculates conductive heat transfer flux with ambient / boundary in W/m^2.
+    back_conductance is in W/(m^2 K).
+    Positive flux corresponds to heat entering the surface from ambient.
+    """
+    return back_conductance * (T_amb - T_surf)
 
 def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero', char_length=None):
     Ca = 1005
@@ -498,46 +573,90 @@ class ThermalHeatTransfer (object):
         spectrum = planck_law(self.wavelengths, T_surf + 273.15) * self.absorptivities
         return trapezoid(y=spectrum, x=self.wavelengths)
 
-    def P_incoming(self, T_amb, humidity=0, cloud_cover=0):
-        assert self.sky_view_factor is not None, "Sky view factor must be set"
-        spectrum1 = planck_law(self.wavelengths, T_amb + 273.15) * self.absorptivities
-        integral_1 = trapezoid(y=spectrum1, x=self.wavelengths)
-
-        humidity_spectrum = spectrum1 * self.spectral_humidity_model(self.wavelengths, humidity)
+    def sky_spectrum(self, T_amb, humidity=0, cloud_cover=0):
+        """
+        Downwelling spectral sky radiance (W/m^3) incident on a horizontal blackbody,
+        i.e. NOT weighted by the panel's spectral absorptivity.
+        """
+        bb_amb = planck_law(self.wavelengths, T_amb + 273.15)
+        humidity_spectrum = bb_amb * self.spectral_humidity_model(self.wavelengths, humidity)
         if cloud_cover > 0.05:
             cloud_spectrum = planck_law(self.wavelengths, self.cloud_temperature(T_amb) + 273.15)
-            spectrum2 = cloud_spectrum*cloud_cover + (1-cloud_cover)*humidity_spectrum
-        else:
-            spectrum2 = humidity_spectrum
+            return cloud_spectrum*cloud_cover + (1-cloud_cover)*humidity_spectrum
+        return humidity_spectrum
 
-         #Clearsky, incident radiation is due to humidity
+    def ground_temperature(self, T_amb, ghi=None, humidity=0, cloud_cover=0):
+        """
+        Quasi-steady, linearised energy balance of horizontal ground (Celsius):
+
+            T_g = T_amb + [(1 - albedo) * GHI - eps_g * (L_bb(T_amb) - L_sky)] / h_eff
+
+        albedo  : surface.surrounds_albedo (same value used for ground-reflected solar)
+        eps_g   : surface.ground_emissivity
+        h_eff   : surface.ground_h_eff, W/(m^2 K); lumps convection, linearised radiation
+                  and conduction into the ground. If None, T_g = T_amb (legacy behaviour).
+        L_bb, L_sky are integrated over the same wavelength range as the panel model.
+        """
+        surf = self._surface
+        h_eff = getattr(surf, 'ground_h_eff', None) if surf is not None else None
+        if ghi is None or h_eff is None or h_eff <= 0:
+            return T_amb
+
+        albedo = getattr(surf, 'surrounds_albedo', 0.15)
+        eps_g = getattr(surf, 'ground_emissivity', 0.95)
+
+        L_bb_amb = trapezoid(y=planck_law(self.wavelengths, T_amb + 273.15), x=self.wavelengths)
+        L_sky = trapezoid(y=self.sky_spectrum(T_amb, humidity, cloud_cover), x=self.wavelengths)
+
+        net_lw_loss = eps_g * (L_bb_amb - L_sky)
+        return T_amb + ((1 - albedo) * max(ghi, 0.0) - net_lw_loss) / h_eff
+
+    def P_incoming(self, T_amb, humidity=0, cloud_cover=0, ghi=None):
+        assert self.sky_view_factor is not None, "Sky view factor must be set"
+        # Surroundings (ground) term: blackbody at the modelled ground temperature
+        T_ground = self.ground_temperature(T_amb, ghi=ghi, humidity=humidity, cloud_cover=cloud_cover)
+        spectrum1 = planck_law(self.wavelengths, T_ground + 273.15) * self.absorptivities
+        integral_1 = trapezoid(y=spectrum1, x=self.wavelengths)
+
+        # Sky term. Clearsky, incident radiation is due to humidity
+        spectrum2 = self.sky_spectrum(T_amb, humidity, cloud_cover) * self.absorptivities
         integral_2 = trapezoid(y=spectrum2, x=self.wavelengths)
 
         return (1-self.sky_view_factor) * integral_1 + (self.sky_view_factor) * integral_2
 
-    def __call__(self, T_amb, T_surf, humidity=0, cloud_cover=0):
-        return self.P_incoming(T_amb, humidity=humidity, cloud_cover=cloud_cover) - self.P_outgoing(T_surf)
+    def __call__(self, T_amb, T_surf, humidity=0, cloud_cover=0, ghi=None):
+        return self.P_incoming(T_amb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi) - self.P_outgoing(T_surf)
 
 
 
-def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None):
+def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None, back_conductance=None, ghi=None):
     """
     The objective function that we want to equal zero.
     Calculates the net heat flux for a given guess of surface temperature (Tc_guess).
+    ghi: global horizontal irradiance (W/m^2), used to estimate the ground temperature.
+         If None, the ground is assumed to be at ambient temperature.
     """
     Lv = 2256*1e3 # latent heat of vapourisation
 
     # Calculate individual heat fluxes
-    P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover)
+    P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi)
     P_sol = (1 - reflectivity) * irradiance
     tilt = radht.surface.tilt if (hasattr(radht, 'surface') and radht.surface is not None) else 0.0
     P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model, char_length=char_length)
     P_lat = Lv * cond_rate # 0, unless condensation rate provided
 
+    # Conductive heat flux through insulation with ambient air (T_boundary = T_amb)
+    if back_conductance is None:
+        if hasattr(radht, 'surface') and radht.surface is not None:
+            back_conductance = getattr(radht.surface, 'back_conductance', 0.0)
+        else:
+            back_conductance = 0.0
+    P_cond = Pconduction(Tamb, Tsurf_guess[0], back_conductance=back_conductance)
+
     # print (f'LWIR out: {P_out:.1f}, LWIR in: {P_inc:.1f}, solar: {P_sol:.1f}')
     # Calculate net flux (Outgoing minus all incoming/generated heat)
     # At equilibrium, this should equal 0.
-    net_flux = P_rad + P_sol + P_conv + P_lat
+    net_flux = P_rad + P_sol + P_conv + P_lat + P_cond
 
     return net_flux
 
