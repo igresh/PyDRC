@@ -183,6 +183,35 @@ class SurfaceSimulator(object):
             for t in t_exp
         ]
 
+        # Modelled downwelling atmospheric thermal radiation (W/m^2) on a horizontal blackbody
+        # In-band: integrated over the panel's simulation wavelength range (e.g. 2.5 - 25 um)
+        sim_df['Theory - downwelling_sky_flux'] = [
+            self.Prad_function.downwelling_sky_radiation(
+                float(self.interp_Tamb(t)),
+                humidity=float(self.interp_Humid(t)),
+                cloud_cover=float(self.interp_cloud(t)),
+                broadband=False
+            )
+            for t in t_exp
+        ]
+        # Broadband: integrated over the full meteorological thermal IR spectrum (2.5 - 100 um, directly comparable to ERA5 strd)
+        sim_df['Theory - strd_broadband'] = [
+            self.Prad_function.downwelling_sky_radiation(
+                float(self.interp_Tamb(t)),
+                humidity=float(self.interp_Humid(t)),
+                cloud_cover=float(self.interp_cloud(t)),
+                broadband=True
+            )
+            for t in t_exp
+        ]
+        sim_df['Theory - strd'] = sim_df['Theory - strd_broadband']
+
+        # If measured or ERA5 strd is present in the dataset, compute diagnostic residuals
+        if 'strd' in self.exp_df.columns:
+            sim_df['strd'] = self.exp_df['strd'].values
+            sim_df['Diagnostic - strd_error_broadband'] = sim_df['Theory - strd_broadband'] - sim_df['strd']
+            sim_df['Diagnostic - strd_error_inband'] = sim_df['Theory - downwelling_sky_flux'] - sim_df['strd']
+
         # Cumulative condensation is the current condensed mass plus cumulative evaporated mass
         sim_df['Theory - cumulative condensation'] = sim_df['Theory - condensed_mass'] + sim_df['Theory - c']
 
@@ -288,6 +317,20 @@ def make_dataframe(df_section, surface):
         new_df['Dew collected, mL/m2'] = df_section[dew_col]
     else:
         new_df['Dew collected, mL/m2'] = 0.0
+
+    strd_col = ('ERA5_Thermal', 'Surface long-wave (thermal) radiation downwards, W/m^2')
+
+
+    if strd_col is not None:
+        raw_strd = df_section[strd_col].copy()
+        # ERA5 hourly accumulated data is reported in J/m^2 (typical magnitude ~ 1e6).
+        # Divide by 3600 seconds to convert to mean flux in W/m^2.
+        col_name_str = str(strd_col)
+        if 'J/m^2' in col_name_str or (pd.api.types.is_numeric_dtype(raw_strd) and raw_strd.dropna().mean() > 5000):
+            new_df['strd'] = raw_strd / 3600.0
+        else:
+            new_df['strd'] = raw_strd
+
 
     return new_df
 
@@ -611,6 +654,48 @@ class ThermalHeatTransfer (object):
         net_lw_loss = eps_g * (L_bb_amb - L_sky)
         return T_amb + ((1 - albedo) * max(ghi, 0.0) - net_lw_loss) / h_eff
 
+    def downwelling_sky_radiation(self, T_amb, humidity=0, cloud_cover=0, broadband=True):
+        """
+        Calculates downwelling longwave radiation from the sky on a horizontal blackbody (W/m^2).
+        
+        Parameters:
+        -----------
+        T_amb : float
+            Ambient temperature in Celsius.
+        humidity : float
+            Relative humidity (%).
+        cloud_cover : float
+            Cloud cover fraction (0.0 to 1.0).
+        broadband : bool, default True
+            If True, integrates across the full meteorological thermal infrared spectrum (2.5 - 100 um),
+            directly corresponding to ERA5 'strd' or a broadband pyrgeometer.
+            If False, integrates across self.wavelengths (the panel's simulation band).
+        """
+        if not broadband:
+            spectrum = self.sky_spectrum(T_amb, humidity=humidity, cloud_cover=cloud_cover)
+            return trapezoid(y=spectrum, x=self.wavelengths)
+        else:
+            if not hasattr(self, '_broadband_wavs'):
+                self._broadband_wavs = np.linspace(2.5e-6, 100.0e-6, 300)
+            wavs = self._broadband_wavs
+            bb_amb = planck_law(wavs, T_amb + 273.15)
+            h_spec = bb_amb * self.spectral_humidity_model(wavs, humidity)
+            if cloud_cover > 0.05:
+                cloud_spec = planck_law(wavs, self.cloud_temperature(T_amb) + 273.15)
+                full_sky = cloud_spec * cloud_cover + (1.0 - cloud_cover) * h_spec
+            else:
+                full_sky = h_spec
+            return trapezoid(y=full_sky, x=wavs)
+
+    def effective_sky_emissivity(self, T_amb, humidity=0, cloud_cover=0, broadband=True):
+        """
+        Calculates effective broadband sky emissivity: eps_sky = L_sky / (sigma * T_amb^4).
+        """
+        sigma = 5.670374e-8
+        T_k = T_amb + 273.15
+        L_sky = self.downwelling_sky_radiation(T_amb, humidity=humidity, cloud_cover=cloud_cover, broadband=broadband)
+        return L_sky / (sigma * (T_k ** 4))
+
     def P_incoming(self, T_amb, humidity=0, cloud_cover=0, ghi=None):
         assert self.sky_view_factor is not None, "Sky view factor must be set"
         # Surroundings (ground) term: blackbody at the modelled ground temperature
@@ -691,3 +776,185 @@ def plot_simulation(df, relT=False):
     ax1.set(xlim=[df.index[1], df.index[-2]], ylim=ybounds, ylabel='Temperature, C')
     ax1t.set(ylim=[0,999], ylabel='Solar radiation [W/m2]')
     ax2.set(ylabel='Dew collected, L/m2')
+
+
+def diagnose_strd(df, radht=None, plot=True, title='Downwelling Longwave Radiation (strd) Diagnostic'):
+    """
+    Diagnostic tool comparing modelled downwelling atmospheric thermal radiation against measured/ERA5 'strd'.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame from make_dataframe or run_simulation.
+        Must contain 'Tamb', 'Humidity', 'Cloud cover'.
+        If 'strd' is present, full statistical comparisons are generated.
+    radht : ThermalHeatTransfer, optional
+        Used to compute 'Theory - strd_broadband' and 'Theory - downwelling_sky_flux'
+        if they are not already present in df.
+    plot : bool, default True
+        Whether to generate and return diagnostic plots.
+    title : str, default 'Downwelling Longwave Radiation (strd) Diagnostic'
+        Title for the diagnostic plot.
+        
+    Returns:
+    --------
+    stats : dict
+        Statistical error metrics and performance breakdown.
+    fig : matplotlib.figure.Figure (optional, only if plot=True)
+    """
+    df = df.copy()
+
+    # If theory columns are missing, compute them using radht if available
+    if 'Theory - strd_broadband' not in df.columns or 'Theory - downwelling_sky_flux' not in df.columns:
+        if radht is None:
+            raise ValueError(
+                "Neither 'Theory - strd_broadband' is in df nor was a 'radht' (ThermalHeatTransfer) instance provided. "
+                "Please run run_simulation() first or pass radht=..."
+            )
+        df['Theory - downwelling_sky_flux'] = [
+            radht.downwelling_sky_radiation(row['Tamb'], humidity=row['Humidity'], cloud_cover=row['Cloud cover'], broadband=False)
+            for _, row in df.iterrows()
+        ]
+        df['Theory - strd_broadband'] = [
+            radht.downwelling_sky_radiation(row['Tamb'], humidity=row['Humidity'], cloud_cover=row['Cloud cover'], broadband=True)
+            for _, row in df.iterrows()
+        ]
+
+    has_measured = 'strd' in df.columns and not df['strd'].dropna().empty
+
+    stats = {
+        'n_samples': len(df),
+        'mean_theory_broadband': float(df['Theory - strd_broadband'].mean()),
+        'mean_theory_inband': float(df['Theory - downwelling_sky_flux'].mean()),
+        'has_measured_strd': has_measured
+    }
+
+    if has_measured:
+        valid_mask = df['strd'].notnull() & df['Theory - strd_broadband'].notnull()
+        valid_df = df[valid_mask]
+        
+        diff_broadband = valid_df['Theory - strd_broadband'] - valid_df['strd']
+        diff_inband = valid_df['Theory - downwelling_sky_flux'] - valid_df['strd']
+
+        stats['mean_measured_strd'] = float(valid_df['strd'].mean())
+        stats['mbe_broadband'] = float(diff_broadband.mean())
+        stats['rmse_broadband'] = float(np.sqrt((diff_broadband ** 2).mean()))
+        stats['mbe_inband'] = float(diff_inband.mean())
+        stats['rmse_inband'] = float(np.sqrt((diff_inband ** 2).mean()))
+
+        # Clear-sky subset (cloud <= 0.1) -> Isolates atmospheric water vapor & humidity model
+        clear_mask = valid_df['Cloud cover'] <= 0.1
+        if clear_mask.any():
+            stats['n_clear_sky'] = int(clear_mask.sum())
+            stats['clear_sky_mean_measured'] = float(valid_df.loc[clear_mask, 'strd'].mean())
+            stats['clear_sky_mean_model'] = float(valid_df.loc[clear_mask, 'Theory - strd_broadband'].mean())
+            stats['clear_sky_mbe'] = float(diff_broadband[clear_mask].mean())
+            stats['clear_sky_rmse'] = float(np.sqrt((diff_broadband[clear_mask] ** 2).mean()))
+
+        # Overcast subset (cloud >= 0.8) -> Isolates cloud temperature & emissivity model
+        overcast_mask = valid_df['Cloud cover'] >= 0.8
+        if overcast_mask.any():
+            stats['n_overcast'] = int(overcast_mask.sum())
+            stats['overcast_mean_measured'] = float(valid_df.loc[overcast_mask, 'strd'].mean())
+            stats['overcast_mean_model'] = float(valid_df.loc[overcast_mask, 'Theory - strd_broadband'].mean())
+            stats['overcast_mbe'] = float(diff_broadband[overcast_mask].mean())
+            stats['overcast_rmse'] = float(np.sqrt((diff_broadband[overcast_mask] ** 2).mean()))
+
+    # Print summary report
+    print("=" * 65)
+    print("         DOWNWELLING LONGWAVE (strd) DIAGNOSTIC REPORT")
+    print("=" * 65)
+    print(f"Total samples: {stats['n_samples']}")
+    print(f"Modelled downwelling (broadband, 2.5-100 um): {stats['mean_theory_broadband']:.1f} W/m^2")
+    print(f"Modelled downwelling (in-band):              {stats['mean_theory_inband']:.1f} W/m^2")
+
+    if has_measured:
+        print(f"Measured/ERA5 strd downwelling:             {stats['mean_measured_strd']:.1f} W/m^2")
+        print(f"Overall Broadband Bias (MBE):               {stats['mbe_broadband']:+.1f} W/m^2")
+        print(f"Overall Broadband RMSE:                     {stats['rmse_broadband']:.1f} W/m^2")
+        print("-" * 65)
+        print("PHYSICAL BREAKDOWN:")
+        if 'n_clear_sky' in stats:
+            print(f"* Clear-sky (Cloud <= 0.1, N={stats['n_clear_sky']}):")
+            print(f"  - ERA5: {stats['clear_sky_mean_measured']:.1f} W/m^2 | Model: {stats['clear_sky_mean_model']:.1f} W/m^2")
+            print(f"  - MBE: {stats['clear_sky_mbe']:+.1f} W/m^2 | RMSE: {stats['clear_sky_rmse']:.1f} W/m^2")
+            if stats['clear_sky_mbe'] < -20:
+                print("  -> Underestimating clear sky longwave (air is more opaque than modeled).")
+            elif stats['clear_sky_mbe'] > 20:
+                print("  -> Overestimating clear sky longwave (air is more transparent than modeled).")
+        if 'n_overcast' in stats:
+            print(f"* Overcast (Cloud >= 0.8, N={stats['n_overcast']}):")
+            print(f"  - ERA5: {stats['overcast_mean_measured']:.1f} W/m^2 | Model: {stats['overcast_mean_model']:.1f} W/m^2")
+            print(f"  - MBE: {stats['overcast_mbe']:+.1f} W/m^2 | RMSE: {stats['overcast_rmse']:.1f} W/m^2")
+    else:
+        print("\nNote: 'strd' column not detected in DataFrame.")
+        print("Once you download ERA5 'strd' and load it into your DataFrame, rerun")
+        print("diagnose_strd(df) to see full bias, RMSE, clear-sky vs overcast breakdown.")
+    print("=" * 65)
+
+    if not plot:
+        return stats
+
+    # Diagnostic Plots
+    fig = plt.figure(figsize=(11, 7))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.2, 1.0])
+
+    ax_time = fig.add_subplot(gs[0, :])
+    ax_scatter = fig.add_subplot(gs[1, 0])
+    ax_resid = fig.add_subplot(gs[1, 1])
+
+    # 1. Time series plot
+    if has_measured:
+        ax_time.plot(df.index, df['strd'], label='ERA5 / Measured strd', color='tab:blue', lw=2)
+    ax_time.plot(df.index, df['Theory - strd_broadband'], label='Model (Broadband)', color='tab:orange', lw=1.8, ls='--')
+    ax_time.plot(df.index, df['Theory - downwelling_sky_flux'], label='Model (In-band)', color='tab:green', lw=1.2, ls=':')
+    ax_time.set_ylabel('Downwelling Flux [W/m²]')
+    ax_time.set_title(title, fontweight='bold', fontsize=12)
+
+    ax_cloud = ax_time.twinx()
+    ax_cloud.fill_between(df.index, df['Cloud cover'], alpha=0.15, color='gray', label='Cloud cover')
+    ax_cloud.set_ylabel('Cloud Cover [0-1]', color='gray')
+    ax_cloud.set_ylim([0, 1.2])
+
+    lines_1, labels_1 = ax_time.get_legend_handles_labels()
+    lines_2, labels_2 = ax_cloud.get_legend_handles_labels()
+    ax_time.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left', framealpha=0.85)
+
+    if has_measured:
+        # 2. Scatter plot (Model vs Measured)
+        sc = ax_scatter.scatter(valid_df['strd'], valid_df['Theory - strd_broadband'],
+                                c=valid_df['Humidity'], cmap='viridis', alpha=0.75, edgecolors='none', s=25)
+        cbar = plt.colorbar(sc, ax=ax_scatter)
+        cbar.set_label('RH [%]')
+
+        min_val = min(valid_df['strd'].min(), valid_df['Theory - strd_broadband'].min()) - 15
+        max_val = max(valid_df['strd'].max(), valid_df['Theory - strd_broadband'].max()) + 15
+        ax_scatter.plot([min_val, max_val], [min_val, max_val], 'k--', lw=1.2, label='1:1 Line')
+        ax_scatter.set_xlim([min_val, max_val])
+        ax_scatter.set_ylim([min_val, max_val])
+        ax_scatter.set_xlabel('ERA5 / Measured strd [W/m²]')
+        ax_scatter.set_ylabel('Modelled Broadband strd [W/m²]')
+        ax_scatter.set_title(f'1:1 Comparison (RMSE={stats["rmse_broadband"]:.1f} W/m²)')
+        ax_scatter.legend(loc='upper left')
+
+        # 3. Residuals vs Relative Humidity
+        diff = valid_df['Theory - strd_broadband'] - valid_df['strd']
+        ax_resid.scatter(valid_df['Humidity'], diff, c=valid_df['Cloud cover'], cmap='coolwarm', alpha=0.75, s=25)
+        ax_resid.axhline(0, color='k', ls='--', lw=1.2)
+        
+        # Fit trendline against humidity if enough points
+        if len(valid_df) > 5 and valid_df['Humidity'].nunique() > 2:
+            p = np.polyfit(valid_df['Humidity'], diff, 1)
+            rh_line = np.linspace(valid_df['Humidity'].min(), valid_df['Humidity'].max(), 50)
+            ax_resid.plot(rh_line, np.polyval(p, rh_line), color='crimson', lw=1.5, label=f'Trend ({p[0]:+.2f} W/m² per %RH)')
+            ax_resid.legend(loc='best')
+
+        ax_resid.set_xlabel('Relative Humidity [%]')
+        ax_resid.set_ylabel('Error: Model - Measured [W/m²]')
+        ax_resid.set_title('Residuals vs Humidity (Color = Cloud Cover)')
+    else:
+        ax_scatter.text(0.5, 0.5, "No 'strd' data available to plot scatter.", ha='center', va='center')
+        ax_resid.text(0.5, 0.5, "No 'strd' data available to plot residuals.", ha='center', va='center')
+
+    plt.tight_layout()
+    return stats, fig
