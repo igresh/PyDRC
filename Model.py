@@ -1,3 +1,4 @@
+import inspect
 import numpy as np
 import pvlib
 from scipy.interpolate import interp1d
@@ -15,10 +16,10 @@ class Surface(object):
     The surface class contains all relevant information about the surface material and position.
     """
     def __init__(self,
-                 solar_reflectivity,
-                 spectral_absorptivity,
-                 tilt,
-                 azimuth,
+                 solar_reflectivity=0.95,
+                 spectral_absorptivity=None,
+                 tilt=0.0,
+                 azimuth=0.0,
                  sky_view_factor=None,
                  surrounds_albedo=0.15,
                  name=None,
@@ -33,17 +34,46 @@ class Surface(object):
                  insulation_conductivity=None,
                  insulation_thickness=None,
                  ground_h_eff=None,
-                 ground_emissivity=0.95):
+                 ground_emissivity=0.95,
+                 thermal_emissivity=0.95):
         """
         ground_h_eff (float or None): effective heat transfer coefficient of the surrounding ground,
             W/(m^2 K). Enables the GHI-driven ground temperature model (typ. 25-35 for concrete/paving).
             If None, the surroundings are assumed to be at ambient air temperature.
         ground_emissivity (float): broadband LWIR emissivity of the ground (typ. 0.90-0.97).
             The ground's solar albedo is taken from surrounds_albedo.
+        thermal_emissivity (float): broadband thermal infrared emissivity (default 0.95).
+            Used to populate the step emissivity model when spectral_absorptivity is None.
         """
+        self._solar_reflectivity = float(solar_reflectivity) if solar_reflectivity is not None else 0.95
+        self._thermal_emissivity = float(thermal_emissivity) if thermal_emissivity is not None else 0.95
 
-        self.solar_reflectivity = solar_reflectivity
-        self.spectral_absorptivity = spectral_absorptivity
+        # Initialize spectral_absorptivity with automatic synchronization
+        if spectral_absorptivity is None:
+            self._spectral_absorptivity = emissivity_model(
+                LWIRemm=self._thermal_emissivity,
+                SWIRemm=1.0 - self._solar_reflectivity
+            )
+        elif isinstance(spectral_absorptivity, (int, float)):
+            self._thermal_emissivity = float(spectral_absorptivity)
+            self._spectral_absorptivity = emissivity_model(
+                LWIRemm=self._thermal_emissivity,
+                SWIRemm=1.0 - self._solar_reflectivity
+            )
+        else:
+            self._spectral_absorptivity = spectral_absorptivity
+            # If a model with solar_reflectivity or SWIRemm was passed, sync it with surface's solar_reflectivity
+            if hasattr(self._spectral_absorptivity, 'solar_reflectivity'):
+                if solar_reflectivity is not None:
+                    self._spectral_absorptivity.solar_reflectivity = self._solar_reflectivity
+                else:
+                    self._solar_reflectivity = self._spectral_absorptivity.solar_reflectivity
+            elif hasattr(self._spectral_absorptivity, 'SWIRemm'):
+                if solar_reflectivity is not None:
+                    self._spectral_absorptivity.SWIRemm = 1.0 - self._solar_reflectivity
+                else:
+                    self._solar_reflectivity = 1.0 - self._spectral_absorptivity.SWIRemm
+
         self.tilt = tilt
         self.azimuth = azimuth
         self.name = name
@@ -61,6 +91,64 @@ class Surface(object):
         self.insulation_thickness = insulation_thickness
         self.ground_h_eff = ground_h_eff
         self.ground_emissivity = ground_emissivity
+
+    @property
+    def solar_reflectivity(self):
+        if hasattr(self._spectral_absorptivity, 'solar_reflectivity'):
+            return self._spectral_absorptivity.solar_reflectivity
+        return self._solar_reflectivity
+
+    @solar_reflectivity.setter
+    def solar_reflectivity(self, R):
+        self._solar_reflectivity = float(R)
+        if hasattr(self._spectral_absorptivity, 'solar_reflectivity'):
+            self._spectral_absorptivity.solar_reflectivity = float(R)
+        elif hasattr(self._spectral_absorptivity, 'SWIRemm'):
+            self._spectral_absorptivity.SWIRemm = 1.0 - float(R)
+
+    @property
+    def solar_absorptivity(self):
+        return 1.0 - self.solar_reflectivity
+
+    @solar_absorptivity.setter
+    def solar_absorptivity(self, alpha):
+        self.solar_reflectivity = 1.0 - float(alpha)
+
+    @property
+    def thermal_emissivity(self):
+        if hasattr(self._spectral_absorptivity, 'LWIRemm'):
+            return self._spectral_absorptivity.LWIRemm
+        return self._thermal_emissivity
+
+    @thermal_emissivity.setter
+    def thermal_emissivity(self, eps):
+        self._thermal_emissivity = float(eps)
+        if hasattr(self._spectral_absorptivity, 'LWIRemm'):
+            self._spectral_absorptivity.LWIRemm = float(eps)
+
+    @property
+    def spectral_absorptivity(self):
+        return self._spectral_absorptivity
+
+    @spectral_absorptivity.setter
+    def spectral_absorptivity(self, model):
+        if isinstance(model, (int, float)):
+            self._thermal_emissivity = float(model)
+            model = emissivity_model(LWIRemm=self._thermal_emissivity, SWIRemm=1.0 - self._solar_reflectivity)
+        self._spectral_absorptivity = model
+        if hasattr(model, 'solar_reflectivity'):
+            model.solar_reflectivity = self._solar_reflectivity
+        elif hasattr(model, 'SWIRemm'):
+            model.SWIRemm = 1.0 - self._solar_reflectivity
+
+    @property
+    def spectral_adsorptivity(self):
+        """Spelling alias for spectral_absorptivity."""
+        return self.spectral_absorptivity
+
+    @spectral_adsorptivity.setter
+    def spectral_adsorptivity(self, model):
+        self.spectral_absorptivity = model
 
     @property
     def back_conductance(self):
@@ -183,14 +271,19 @@ class SurfaceSimulator(object):
             cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length))
         sim_df['Theory - cond rate'] = np.array(cond_rates)
 
-        # Modelled ground temperature (equals Tamb if ground_h_eff is None or GHI unavailable)
+        # Modelled ground temperature (equals Tamb if ground_h_eff is None or GHI unavailable).
+        # Uses the same measured strd as the solver when use_measured_strd=True.
+        use_strd = self.use_measured_strd and self.interp_strd is not None
         sim_df['Theory - Tground'] = [
             self.Prad_function.ground_temperature(float(self.interp_Tamb(t)), ghi=self._ghi(t),
                                                   humidity=float(self.interp_Humid(t)),
-                                                  cloud_cover=float(self.interp_cloud(t)))
+                                                  cloud_cover=float(self.interp_cloud(t)),
+                                                  strd=float(self.interp_strd(t)) if use_strd else None)
             for t in t_exp
         ]
 
+        # NOTE: the two downwelling diagnostics below are always the *unscaled* model prediction,
+        # even when use_measured_strd=True, so that they can be compared against strd.
         # Modelled downwelling atmospheric thermal radiation (W/m^2) on a horizontal blackbody
         # In-band: integrated over the panel's simulation wavelength range (e.g. 2.5 - 25 um)
         sim_df['Theory - downwelling_sky_flux'] = [
@@ -259,8 +352,6 @@ class equil_solver(object):
 
     def T_ghi(self, ghi, reflectivity):
         self.surface.solar_reflectivity = reflectivity
-        # self.surface.spectral_absorptivity.LWIRemm = LWIRemm
-        self.surface.spectral_absorptivity.SWIRemm = 1-reflectivity
         self.radht.update_surface_cache()
 
         ghi_basis = np.linspace(0,1300,13)
@@ -282,8 +373,7 @@ class equil_solver(object):
 
     def T_ghi_LWIRemm(self, ghi, reflectivity, LWIRemm):
         self.surface.solar_reflectivity = reflectivity
-        self.surface.spectral_absorptivity.LWIRemm = LWIRemm
-        self.surface.spectral_absorptivity.SWIRemm = 1-reflectivity
+        self.surface.thermal_emissivity = LWIRemm
         self.radht.update_surface_cache()
 
         ghi_basis = np.linspace(0,1300,13)
@@ -345,29 +435,18 @@ def make_dataframe(df_section, surface):
         strd_col = None
         for candidate in [
             ('ERA5_Weather', 'Surface long-wave (thermal) radiation downwards, W/m^2'),
-            ('ERA5_Weather', 'Surface long-wave (thermal) radiation downwards, J/m^2'),
             ('General', 'Surface long-wave (thermal) radiation downwards, W/m^2'),
-            'Surface long-wave (thermal) radiation downwards, W/m^2',
             ('ERA5_Weather', 'Surface thermal radiation downwards, W/m^2'),
-            ('ERA5_Weather', 'Surface thermal radiation downwards, J/m^2'),
             ('ERA5_Weather', 'strd'),
             ('General', 'strd'),
-            'strd'
         ]:
             if candidate in df_section.columns:
                 strd_col = candidate
                 break
 
     if strd_col is not None and strd_col in df_section.columns:
-        raw_strd = df_section[strd_col].copy()
-        # ERA5 hourly accumulated data is reported in J/m^2 (typical magnitude ~ 1e6).
-        # Divide by 3600 seconds to convert to mean flux in W/m^2.
-        col_name_str = str(strd_col)
-        if 'J/m^2' in col_name_str or (pd.api.types.is_numeric_dtype(raw_strd) and raw_strd.dropna().mean() > 5000):
-            new_df['strd'] = raw_strd / 3600.0
-        else:
-            new_df['strd'] = raw_strd
-
+        # strd is assumed to already be a mean flux in W/m^2
+        new_df['strd'] = df_section[strd_col]
 
     return new_df
 
@@ -530,25 +609,32 @@ def planck_law(wavelength, T_kelvin):
     return numerator / denominator
 
 class emissivity_model(object):
-    def __init__(self, LWIRemm=0.95, SWIRemm=0.02, model=None):
+    """
+    Two-band step emissivity model:
+    - lambda < cutoff_wavelength (default 3.0 µm): SWIRemm (solar absorptivity = 1 - solar_reflectivity)
+    - lambda >= cutoff_wavelength (default 3.0 µm): LWIRemm (thermal infrared emissivity, default 0.95)
+    """
+    def __init__(self, LWIRemm=0.95, SWIRemm=0.02, model=None, cutoff_wavelength=3.0e-6):
         self.LWIRemm = LWIRemm
         self.SWIRemm = SWIRemm
+        self.cutoff_wavelength = cutoff_wavelength
+        self.model = 'step' if (model is None or model == 'Tristram' or model == 'step') else model
 
-        if model == None:
-            self.model = 'Tristram'
+    @property
+    def solar_reflectivity(self):
+        return 1.0 - self.SWIRemm
 
-    def tristram_emissivity (self, wavelength):
-        """
-        wavelength (float or array-like): Wavelength in meters
+    @solar_reflectivity.setter
+    def solar_reflectivity(self, R):
+        self.SWIRemm = 1.0 - R
 
-        return (float or array-like): Emisivity of same shape as wavelength
-        """
+    def tristram_emissivity(self, wavelength):
+        """Legacy Tristram square-root transition model (retained for backward compatibility)."""
         wav = np.atleast_1d(wavelength)
         emis = np.full_like(wav, np.nan, dtype=float)
 
         visIR_mask = np.logical_and(wav >= 0.1e-6, wav <= 2.5e-6)
         midIR_mask = np.logical_and(wav > 2.5e-6, wav <= 8e-6)
-        # Extended mask to cover all wavelengths > 8 µm to avoid NaN at far-IR wavelengths
         LWIR_mask = wav > 8e-6
 
         emis[visIR_mask] = self.SWIRemm
@@ -556,23 +642,35 @@ class emissivity_model(object):
         emis[LWIR_mask] = self.LWIRemm
 
         if emis.size == 1:
-            return emis[0]
+            return float(emis[0])
         else:
             return emis
 
+    def step_emissivity(self, wavelength):
+        wav = np.asarray(wavelength)
+        emis = np.where(wav < self.cutoff_wavelength, self.SWIRemm, self.LWIRemm)
+        if wav.ndim == 0:
+            return float(emis)
+        return emis
+
     def __call__(self, wavelength):
-        if self.model == 'Tristram':
+        if self.model == 'Tristram_legacy':
             return self.tristram_emissivity(wavelength)
         else:
-            raise ValueError('Unknown model')
+            return self.step_emissivity(wavelength)
 
 def spectral_humidCorr (wavelength, humidity, Tamb=None):
     """
     Physical spectral atmospheric emissivity model for clear skies.
+    (Replaces the emperical correction factor used by Tristram: 0.005*humidity in 2.5-13 um, 1.0 above 13 um.)
     
     Parameterized by actual water vapor partial pressure (e in hPa) and ambient temperature (Tamb),
     incorporating foreign-broadened (linear in e) and self-broadened (quadratic in e^2)
     water vapor continuum absorption, ozone emission at 9.6 µm, and rotational water band scaling.
+
+    NOTE: the band parameters are empirically calibrated against ERA5 strd for Sydney, Australia,
+    and are not intended to be transferable to other climates (e.g. cold/dry sites, where it
+    underestimates clear-sky emissivity relative to Brutsaert / Berdahl-Martin).
     
     Parameters:
     -----------
@@ -646,8 +744,10 @@ class ThermalHeatTransfer (object):
 
         self._surface = surface
 
+        self._humidity_model_takes_Tamb = None
+        self._humidity_model_checked = None
         if humidity_model is None:
-            self.spectral_humidity_model = np.zeros_like
+            self.spectral_humidity_model = lambda wavelength, humidity: np.zeros_like(np.asarray(wavelength), dtype=float)
         else:
             self.spectral_humidity_model = humidity_model
 
@@ -685,16 +785,27 @@ class ThermalHeatTransfer (object):
 
     def _eval_humidity_model(self, wavs, humidity, T_amb):
         """
-        Evaluates the assigned spectral humidity model, passing T_amb if accepted.
-        Falls back to 2-argument call for backwards compatibility with custom models.
+        Evaluates the assigned spectral humidity model, passing T_amb only if the model accepts it
+        (a 'Tamb' keyword, or a third positional parameter). Models with a 2-argument signature
+        are called as model(wavs, humidity) for backwards compatibility. Errors raised inside the
+        model are propagated rather than retried.
         """
-        try:
+        if self._humidity_model_takes_Tamb is None or self._humidity_model_checked is not self.spectral_humidity_model:
+            self._humidity_model_checked = self.spectral_humidity_model
+            self._humidity_model_takes_Tamb = self._accepts_Tamb(self.spectral_humidity_model)
+        if self._humidity_model_takes_Tamb:
             return self.spectral_humidity_model(wavs, humidity, Tamb=T_amb)
-        except TypeError:
-            try:
-                return self.spectral_humidity_model(wavs, humidity, T_amb)
-            except TypeError:
-                return self.spectral_humidity_model(wavs, humidity)
+        return self.spectral_humidity_model(wavs, humidity)
+
+    @staticmethod
+    def _accepts_Tamb(model):
+        try:
+            params = inspect.signature(model).parameters
+        except (TypeError, ValueError):
+            return False  # e.g. builtins/ufuncs such as np.zeros_like
+        if 'Tamb' in params:
+            return True
+        return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     def cloud_temperature(self, tamb):
         """
@@ -723,13 +834,27 @@ class ThermalHeatTransfer (object):
         else:
             raw_sky = humidity_spectrum
 
-        if strd is not None and strd > 0:
-            broadband_flux = self.downwelling_sky_radiation(T_amb, humidity=humidity, cloud_cover=cloud_cover, broadband=True)
-            if broadband_flux > 0:
-                scale = strd / broadband_flux
-                return raw_sky * scale
+        scale = self._strd_scale(T_amb, humidity, cloud_cover, strd)
+        return raw_sky * scale
 
-        return raw_sky
+    def _strd_scale(self, T_amb, humidity, cloud_cover, strd):
+        """
+        Factor scaling the modelled broadband downwelling flux to the measured/ERA5 strd (W/m^2).
+        Returns 1.0 if strd is None, non-positive or NaN. The last result is cached, because
+        sky_spectrum is called several times with identical arguments per derivative evaluation
+        (panel sky term and ground temperature), and the broadband integral is comparatively costly.
+        """
+        if strd is None or not (strd > 0):
+            return 1.0
+        key = (float(T_amb), float(humidity), float(cloud_cover), float(strd),
+               self.cloud_temperature_delTamb, id(self.spectral_humidity_model))
+        cached = getattr(self, '_strd_scale_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        broadband_flux = self.downwelling_sky_radiation(T_amb, humidity=humidity, cloud_cover=cloud_cover, broadband=True)
+        scale = strd / broadband_flux if broadband_flux > 0 else 1.0
+        self._strd_scale_cache = (key, scale)
+        return scale
 
     def ground_temperature(self, T_amb, ghi=None, humidity=0, cloud_cover=0, strd=None):
         """
@@ -843,6 +968,7 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
             back_conductance = 0.0
     P_cond = Pconduction(Tamb, Tsurf_guess[0], back_conductance=back_conductance)
 
+    # print (f'LWIR out: {P_out:.1f}, LWIR in: {P_inc:.1f}, solar: {P_sol:.1f}')
     # Calculate net flux (Outgoing minus all incoming/generated heat)
     # At equilibrium, this should equal 0.
     net_flux = P_rad + P_sol + P_conv + P_lat + P_cond
