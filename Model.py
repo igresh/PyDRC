@@ -90,12 +90,14 @@ class SurfaceSimulator(object):
     def __init__(self,
                  surface,
                  prad_function,
-                 exp_df
+                 exp_df,
+                 use_measured_strd=False
                  ):
         self.surface = surface
         self.Prad_function = prad_function
         self.Prad_function.surface = surface
         self.exp_df = exp_df
+        self.use_measured_strd = use_measured_strd
 
         self.interp_Tamb = self.create_interpolator('Tamb')
         self.interp_Humid = self.create_interpolator('Humidity')
@@ -105,6 +107,8 @@ class SurfaceSimulator(object):
         self.interp_cloud = self.create_interpolator('Cloud cover')
         # GHI is used for the ground-temperature model; optional for backwards compatibility
         self.interp_GHI = self.create_interpolator('GHI') if 'GHI' in self.exp_df.columns else None
+        # strd can optionally drive the downwelling atmospheric radiation if present
+        self.interp_strd = self.create_interpolator('strd') if 'strd' in self.exp_df.columns else None
 
         self.heatcap_water = 4184
 
@@ -136,11 +140,15 @@ class SurfaceSimulator(object):
             dmdt = 0.0
             dcdt = 0.0
 
-        dTdt =  heat_cap_surf*heat_balance_equation(Tsurf_guess=[Tsurf], Tamb=Tamb, irradiance=irrad, humidity=humidity, windspeed=windspeed,
-                                                           reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
-                                                           cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length,
-                                                           back_conductance=getattr(self.surface, 'back_conductance', 0.0),
-                                                           ghi=self._ghi(t))
+        strd_val = float(self.interp_strd(t)) if (self.use_measured_strd and self.interp_strd is not None) else None
+
+        dTdt = heat_cap_surf * heat_balance_equation(
+            Tsurf_guess=[Tsurf], Tamb=Tamb, irradiance=irrad, humidity=humidity, windspeed=windspeed,
+            reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
+            cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length,
+            back_conductance=getattr(self.surface, 'back_conductance', 0.0),
+            ghi=self._ghi(t), strd=strd_val
+        )
         return [dmdt,dTdt,dcdt]
 
     def solve(self):
@@ -239,7 +247,7 @@ def calculate_plane_of_array_irradiance(surface, times, exp_ghi):
 
 
 class equil_solver(object):
-    def __init__(self, surface, radht, Tamb, humidity=50, pressure=101.325, windspeed=0, cloud_cover=0):
+    def __init__(self, surface, radht, Tamb, humidity=50, pressure=101.325, windspeed=0, cloud_cover=0, strd=None):
         self.surface = surface
         self.radht = radht
         self.humidity = humidity
@@ -247,6 +255,7 @@ class equil_solver(object):
         self.windspeed = windspeed
         self.cloud_cover = cloud_cover
         self.Tamb = Tamb
+        self.strd = strd
 
     def T_ghi(self, ghi, reflectivity):
         self.surface.solar_reflectivity = reflectivity
@@ -264,7 +273,7 @@ class equil_solver(object):
             Tc_equilibrium, = fsolve(
                 heat_balance_equation,
                 x0=initial_guess,
-                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi)
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi, self.strd)
             )
             Tsurfs.append(Tc_equilibrium)
         GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
@@ -287,7 +296,7 @@ class equil_solver(object):
             Tc_equilibrium, = fsolve(
                 heat_balance_equation,
                 x0=initial_guess,
-                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi)
+                args=(self.Tamb, i_ghi, self.surface.solar_reflectivity, self.radht, self.humidity, self.windspeed, self.cloud_cover, 0.0, self.surface.convection_model, self.surface.char_length, getattr(self.surface, 'back_conductance', 0.0), i_ghi, self.strd)
             )
             Tsurfs.append(Tc_equilibrium)
         GHI_interp = interp1d(ghi_basis, np.array(Tsurfs), kind='linear')
@@ -306,7 +315,20 @@ def make_dataframe(df_section, surface):
     new_df['Tamb'] = df_section[('General', 'Air temp, ˚C')]
     new_df['Humidity'] = df_section[('General', 'RH, %')]
     new_df['Windspeed'] = df_section[('General', 'Windspeed, m/s')]
-    new_df['Cloud cover'] = df_section[('ERA5_Weather', 'Total cloud cover, fraction')]
+    era5_cloud = df_section[('ERA5_Weather', 'Total cloud cover, fraction')]
+    daylight_series = None
+    if hasattr(df_section, 'Category') and hasattr(df_section.Category, '__getitem__') and 'Daylight' in df_section.Category:
+        daylight_series = df_section.Category['Daylight']
+    elif ('Category', 'Daylight') in df_section.columns:
+        daylight_series = df_section[('Category', 'Daylight')]
+
+    if daylight_series is not None and ('General', 'Cloud loss, fraction') in df_section.columns:
+        daylight_bool = daylight_series.fillna(False).astype(bool)
+        loss_cloud = df_section[('General', 'Cloud loss, fraction')]
+        combined_cloud = np.where(daylight_bool & loss_cloud.notnull(), loss_cloud, era5_cloud)
+        new_df['Cloud cover'] = pd.Series(combined_cloud, index=df_section.index, dtype=float)
+    else:
+        new_df['Cloud cover'] = era5_cloud.astype(float)
     new_df['GHI'] = df_section[('General', 'Solar flux density, W/m^2')]
     new_df['irradiance on tilted panels'] = calculate_plane_of_array_irradiance(surface=surface,
                                                                                  times=df_section.index,
@@ -319,9 +341,24 @@ def make_dataframe(df_section, surface):
         new_df['Dew collected, mL/m2'] = 0.0
 
     strd_col = ('ERA5_Thermal', 'Surface long-wave (thermal) radiation downwards, W/m^2')
+    if strd_col not in df_section.columns:
+        strd_col = None
+        for candidate in [
+            ('ERA5_Weather', 'Surface long-wave (thermal) radiation downwards, W/m^2'),
+            ('ERA5_Weather', 'Surface long-wave (thermal) radiation downwards, J/m^2'),
+            ('General', 'Surface long-wave (thermal) radiation downwards, W/m^2'),
+            'Surface long-wave (thermal) radiation downwards, W/m^2',
+            ('ERA5_Weather', 'Surface thermal radiation downwards, W/m^2'),
+            ('ERA5_Weather', 'Surface thermal radiation downwards, J/m^2'),
+            ('ERA5_Weather', 'strd'),
+            ('General', 'strd'),
+            'strd'
+        ]:
+            if candidate in df_section.columns:
+                strd_col = candidate
+                break
 
-
-    if strd_col is not None:
+    if strd_col is not None and strd_col in df_section.columns:
         raw_strd = df_section[strd_col].copy()
         # ERA5 hourly accumulated data is reported in J/m^2 (typical magnitude ~ 1e6).
         # Divide by 3600 seconds to convert to mean flux in W/m^2.
@@ -529,27 +566,68 @@ class emissivity_model(object):
         else:
             raise ValueError('Unknown model')
 
-def spectral_humidCorr (wavelength, humidity):
+def spectral_humidCorr (wavelength, humidity, Tamb=None):
     """
-    :param wavelength (float or array): wavelength in m:
-    :param humidity: Relative humidity in %:
-    :return:
-
-    Emperical correction factor used by Tristram.
+    Physical spectral atmospheric emissivity model for clear skies.
+    
+    Parameterized by actual water vapor partial pressure (e in hPa) and ambient temperature (Tamb),
+    incorporating foreign-broadened (linear in e) and self-broadened (quadratic in e^2)
+    water vapor continuum absorption, ozone emission at 9.6 µm, and rotational water band scaling.
+    
+    Parameters:
+    -----------
+    wavelength : float or array-like
+        Wavelength in meters.
+    humidity : float
+        Relative humidity in % (0 - 100).
+    Tamb : float, optional
+        Ambient air temperature in degrees Celsius. Defaults to 20.0 °C if not provided
+        for backwards compatibility with 2-argument calls.
     """
     wav = np.atleast_1d(wavelength)
-    h_corr = np.full_like(wav, np.nan, dtype=float)
+    h_corr = np.zeros_like(wav, dtype=float)
 
-    visIR_mask = np.logical_and(wav >= 0.1e-6, wav <= 2.5e-6)
-    midIR_mask = np.logical_and(wav > 2.5e-6, wav <= 8e-6)
-    LWIR_mask = np.logical_and(wav > 8e-6, wav <= 13e-6)
-    # Wavelengths > 13 µm act as a blackbody in the atmosphere due to H2O/CO2 absorption
-    farIR_mask = wav > 13e-6
+    if Tamb is None:
+        Tamb = 20.0
 
-    h_corr[visIR_mask] = 0
-    h_corr[midIR_mask] = 0.005*humidity
-    h_corr[LWIR_mask] = 0.005*humidity
-    h_corr[farIR_mask] = 1.0
+    # Actual water vapor partial pressure in hPa
+    e_kpa = (humidity / 100.0) * VPsat(Tamb)
+    e_hpa = np.maximum(0.001, e_kpa * 10.0)
+
+    # 1. 2.5 - 5.0 µm: Solar / Mid-IR semi-transparent continuum
+    m_mid_trans = (wav >= 2.5e-6) & (wav < 5.0e-6)
+    h_corr[m_mid_trans] = 0.002 * e_hpa
+
+    # 2. 5.0 - 8.0 µm: H2O v2 vibrational-rotational band centered at 6.3 µm
+    m_h2o_band = (wav >= 5.0e-6) & (wav <= 8.0e-6)
+    dist_63 = np.abs(wav[m_h2o_band] - 6.3e-6) / 1.0e-6
+    # Core absorption with moisture-dependent wing broadening
+    h_corr[m_h2o_band] = (0.88 - 0.20 * dist_63) * (1.0 - np.exp(-0.06 * (0.3 + 1.5 * np.exp(-dist_63**2)) * e_hpa))
+
+    # 3. 8.0 - 13.0 µm: Primary atmospheric transparency window
+    m_window = (wav > 8.0e-6) & (wav <= 13.0e-6)
+    # Foreign-broadened (linear) + self-broadened (quadratic e^2) continuum
+    eps_continuum = 1.0 - np.exp(-0.040 * e_hpa - 0.0008 * (e_hpa**2))
+    h_corr[m_window] = 0.07 + (1.0 - 0.07) * eps_continuum
+
+    # Ozone (O3) band centered at 9.6 µm (9.3 - 10.0 µm)
+    # Ozone resides in the cold stratosphere (~210-230 K), yielding an effective
+    # surface downward emissivity floor of ~0.44 referenced to ambient surface temperature.
+    m_o3 = (wav >= 9.3e-6) & (wav <= 10.0e-6)
+    h_corr[m_o3] = np.maximum(h_corr[m_o3], 0.44)
+
+    # 4. > 13.0 µm: Far-IR CO2 and rotational water vapor bands
+    # 13.0 - 16.5 µm: CO2 15 µm band is completely opaque blackbody (~1.0)
+    m_co2 = (wav > 13.0e-6) & (wav <= 16.5e-6)
+    h_corr[m_co2] = 1.0
+
+    # > 16.5 µm: Rotational water vapor bands
+    # In dry air with low optical depth, downward radiation originates from cold aloft layers (~0.52-0.65);
+    # in humid air, near-surface layer is opaque (~0.98-1.0)
+    m_far = wav > 16.5e-6
+    h_corr[m_far] = 0.52 + (1.0 - 0.52) * (1.0 - np.exp(-0.25 * e_hpa))
+
+    h_corr = np.clip(h_corr, 0.0, 1.0)
 
     if h_corr.size == 1:
         return h_corr[0]
@@ -560,7 +638,7 @@ class ThermalHeatTransfer (object):
     def __init__ (self, low_wavelength, high_wavelength, num_wavelengths,
                   surface=None,
                   humidity_model=None,
-                  cloud_temperature_delTamb=0): #Assume clouds are at ambient temperature - should probably be -20IMPORTANT
+                  cloud_temperature_delTamb=-8.0): # Offset between cloud-base temp and surface ambient (default -8.0 K matches tropospheric lapse and ERA5 overcast radiation)
         self.low_wavelength = low_wavelength
         self.high_wavelength = high_wavelength
         self.num_wavelengths = num_wavelengths
@@ -605,6 +683,19 @@ class ThermalHeatTransfer (object):
             self.absorptivities = None
             self.sky_view_factor = 1
 
+    def _eval_humidity_model(self, wavs, humidity, T_amb):
+        """
+        Evaluates the assigned spectral humidity model, passing T_amb if accepted.
+        Falls back to 2-argument call for backwards compatibility with custom models.
+        """
+        try:
+            return self.spectral_humidity_model(wavs, humidity, Tamb=T_amb)
+        except TypeError:
+            try:
+                return self.spectral_humidity_model(wavs, humidity, T_amb)
+            except TypeError:
+                return self.spectral_humidity_model(wavs, humidity)
+
     def cloud_temperature(self, tamb):
         """
         tamb (float): Temperature in degrees celsius
@@ -616,19 +707,31 @@ class ThermalHeatTransfer (object):
         spectrum = planck_law(self.wavelengths, T_surf + 273.15) * self.absorptivities
         return trapezoid(y=spectrum, x=self.wavelengths)
 
-    def sky_spectrum(self, T_amb, humidity=0, cloud_cover=0):
+    def sky_spectrum(self, T_amb, humidity=0, cloud_cover=0, strd=None):
         """
         Downwelling spectral sky radiance (W/m^3) incident on a horizontal blackbody,
         i.e. NOT weighted by the panel's spectral absorptivity.
+
+        If strd (W/m^2) is provided, the downwelling spectrum is scaled to match
+        the measured/ERA5 broadband downwelling flux.
         """
         bb_amb = planck_law(self.wavelengths, T_amb + 273.15)
-        humidity_spectrum = bb_amb * self.spectral_humidity_model(self.wavelengths, humidity)
+        humidity_spectrum = bb_amb * self._eval_humidity_model(self.wavelengths, humidity, T_amb)
         if cloud_cover > 0.05:
             cloud_spectrum = planck_law(self.wavelengths, self.cloud_temperature(T_amb) + 273.15)
-            return cloud_spectrum*cloud_cover + (1-cloud_cover)*humidity_spectrum
-        return humidity_spectrum
+            raw_sky = cloud_spectrum * cloud_cover + (1.0 - cloud_cover) * humidity_spectrum
+        else:
+            raw_sky = humidity_spectrum
 
-    def ground_temperature(self, T_amb, ghi=None, humidity=0, cloud_cover=0):
+        if strd is not None and strd > 0:
+            broadband_flux = self.downwelling_sky_radiation(T_amb, humidity=humidity, cloud_cover=cloud_cover, broadband=True)
+            if broadband_flux > 0:
+                scale = strd / broadband_flux
+                return raw_sky * scale
+
+        return raw_sky
+
+    def ground_temperature(self, T_amb, ghi=None, humidity=0, cloud_cover=0, strd=None):
         """
         Quasi-steady, linearised energy balance of horizontal ground (Celsius):
 
@@ -649,7 +752,7 @@ class ThermalHeatTransfer (object):
         eps_g = getattr(surf, 'ground_emissivity', 0.95)
 
         L_bb_amb = trapezoid(y=planck_law(self.wavelengths, T_amb + 273.15), x=self.wavelengths)
-        L_sky = trapezoid(y=self.sky_spectrum(T_amb, humidity, cloud_cover), x=self.wavelengths)
+        L_sky = trapezoid(y=self.sky_spectrum(T_amb, humidity=humidity, cloud_cover=cloud_cover, strd=strd), x=self.wavelengths)
 
         net_lw_loss = eps_g * (L_bb_amb - L_sky)
         return T_amb + ((1 - albedo) * max(ghi, 0.0) - net_lw_loss) / h_eff
@@ -679,7 +782,7 @@ class ThermalHeatTransfer (object):
                 self._broadband_wavs = np.linspace(2.5e-6, 100.0e-6, 300)
             wavs = self._broadband_wavs
             bb_amb = planck_law(wavs, T_amb + 273.15)
-            h_spec = bb_amb * self.spectral_humidity_model(wavs, humidity)
+            h_spec = bb_amb * self._eval_humidity_model(wavs, humidity, T_amb)
             if cloud_cover > 0.05:
                 cloud_spec = planck_law(wavs, self.cloud_temperature(T_amb) + 273.15)
                 full_sky = cloud_spec * cloud_cover + (1.0 - cloud_cover) * h_spec
@@ -696,35 +799,37 @@ class ThermalHeatTransfer (object):
         L_sky = self.downwelling_sky_radiation(T_amb, humidity=humidity, cloud_cover=cloud_cover, broadband=broadband)
         return L_sky / (sigma * (T_k ** 4))
 
-    def P_incoming(self, T_amb, humidity=0, cloud_cover=0, ghi=None):
+    def P_incoming(self, T_amb, humidity=0, cloud_cover=0, ghi=None, strd=None):
         assert self.sky_view_factor is not None, "Sky view factor must be set"
         # Surroundings (ground) term: blackbody at the modelled ground temperature
-        T_ground = self.ground_temperature(T_amb, ghi=ghi, humidity=humidity, cloud_cover=cloud_cover)
+        T_ground = self.ground_temperature(T_amb, ghi=ghi, humidity=humidity, cloud_cover=cloud_cover, strd=strd)
         spectrum1 = planck_law(self.wavelengths, T_ground + 273.15) * self.absorptivities
         integral_1 = trapezoid(y=spectrum1, x=self.wavelengths)
 
         # Sky term. Clearsky, incident radiation is due to humidity
-        spectrum2 = self.sky_spectrum(T_amb, humidity, cloud_cover) * self.absorptivities
+        spectrum2 = self.sky_spectrum(T_amb, humidity=humidity, cloud_cover=cloud_cover, strd=strd) * self.absorptivities
         integral_2 = trapezoid(y=spectrum2, x=self.wavelengths)
 
         return (1-self.sky_view_factor) * integral_1 + (self.sky_view_factor) * integral_2
 
-    def __call__(self, T_amb, T_surf, humidity=0, cloud_cover=0, ghi=None):
-        return self.P_incoming(T_amb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi) - self.P_outgoing(T_surf)
+    def __call__(self, T_amb, T_surf, humidity=0, cloud_cover=0, ghi=None, strd=None):
+        return self.P_incoming(T_amb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi, strd=strd) - self.P_outgoing(T_surf)
 
 
 
-def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None, back_conductance=None, ghi=None):
+def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None, back_conductance=None, ghi=None, strd=None):
     """
     The objective function that we want to equal zero.
     Calculates the net heat flux for a given guess of surface temperature (Tc_guess).
     ghi: global horizontal irradiance (W/m^2), used to estimate the ground temperature.
          If None, the ground is assumed to be at ambient temperature.
+    strd: downwelling longwave radiation (W/m^2) from ERA5 or pyrgeometer.
+          If provided, scales the incident sky spectrum directly.
     """
     Lv = 2256*1e3 # latent heat of vapourisation
 
     # Calculate individual heat fluxes
-    P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi)
+    P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi, strd=strd)
     P_sol = (1 - reflectivity) * irradiance
     tilt = radht.surface.tilt if (hasattr(radht, 'surface') and radht.surface is not None) else 0.0
     P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model, char_length=char_length)
@@ -738,7 +843,6 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
             back_conductance = 0.0
     P_cond = Pconduction(Tamb, Tsurf_guess[0], back_conductance=back_conductance)
 
-    # print (f'LWIR out: {P_out:.1f}, LWIR in: {P_inc:.1f}, solar: {P_sol:.1f}')
     # Calculate net flux (Outgoing minus all incoming/generated heat)
     # At equilibrium, this should equal 0.
     net_flux = P_rad + P_sol + P_conv + P_lat + P_cond
@@ -939,13 +1043,17 @@ def diagnose_strd(df, radht=None, plot=True, title='Downwelling Longwave Radiati
 
         # 3. Residuals vs Relative Humidity
         diff = valid_df['Theory - strd_broadband'] - valid_df['strd']
-        ax_resid.scatter(valid_df['Humidity'], diff, c=valid_df['Cloud cover'], cmap='coolwarm', alpha=0.75, s=25)
+        cloud_colors = valid_df['Cloud cover'].fillna(0.0) if 'Cloud cover' in valid_df.columns else np.zeros(len(valid_df))
+        sc_resid = ax_resid.scatter(valid_df['Humidity'], diff, c=cloud_colors, cmap='coolwarm', alpha=0.75, s=25, vmin=0.0, vmax=1.0)
+        cbar_resid = plt.colorbar(sc_resid, ax=ax_resid)
+        cbar_resid.set_label('Cloud cover [0-1]')
         ax_resid.axhline(0, color='k', ls='--', lw=1.2)
         
         # Fit trendline against humidity if enough points
-        if len(valid_df) > 5 and valid_df['Humidity'].nunique() > 2:
-            p = np.polyfit(valid_df['Humidity'], diff, 1)
-            rh_line = np.linspace(valid_df['Humidity'].min(), valid_df['Humidity'].max(), 50)
+        mask_fit = valid_df['Humidity'].notnull() & diff.notnull()
+        if mask_fit.sum() > 5 and valid_df.loc[mask_fit, 'Humidity'].nunique() > 2:
+            p = np.polyfit(valid_df.loc[mask_fit, 'Humidity'], diff[mask_fit], 1)
+            rh_line = np.linspace(valid_df.loc[mask_fit, 'Humidity'].min(), valid_df.loc[mask_fit, 'Humidity'].max(), 50)
             ax_resid.plot(rh_line, np.polyval(p, rh_line), color='crimson', lw=1.5, label=f'Trend ({p[0]:+.2f} W/m² per %RH)')
             ax_resid.legend(loc='best')
 
