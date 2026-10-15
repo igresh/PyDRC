@@ -666,7 +666,10 @@ def spectral_humidCorr (wavelength, humidity, Tamb=None):
     
     Parameterized by actual water vapor partial pressure (e in hPa) and ambient temperature (Tamb),
     incorporating realistic atmospheric absorption features matching libRadtran / MODTRAN spectroscopy:
-      - <= 7.8 µm: Continuous saturated plateau (H2O v1, v2, v3 and CO2 bands)
+      - < 2.5 µm: Solar transparent window (atmospheric emissivity ~ 0.0)
+      - 2.5 - 3.0 µm: Opaque 2.7 µm H2O/CO2 absorption band (eps = 1.0)
+      - 3.0 - 3.8 µm: Smooth transition wing from 2.7 µm band down to plateau
+      - 3.8 - 7.8 µm: Saturated moisture-dependent plateau (eps_plat)
       - 7.8 - 8.3 µm: Smooth transition wing rolling off into the primary window
       - 8.3 - 12.5 µm: Primary atmospheric transparency window (water vapor continuum + 9.6 µm ozone)
       - 12.5 - 13.5 µm: Smooth transition wing connecting into the 15 µm CO2 band
@@ -698,7 +701,7 @@ def spectral_humidCorr (wavelength, humidity, Tamb=None):
     eps_cont = 1.0 - np.exp(-0.035 * e_hpa - 0.0006 * (e_hpa**2))
     eps_win = 0.045 + (1.0 - 0.045) * eps_cont
 
-    # Moisture-dependent saturated plateau height for short wavelengths (<= 7.8 µm).
+    # Moisture-dependent saturated plateau height for short wavelengths (3.8 - 7.8 µm).
     # In dry air, optical depth in the lower troposphere is reduced and downward emission
     # originates from colder layers aloft (effective emissivity ~0.50-0.60 referenced to surface Tamb);
     # in humid air, near-surface layer saturates (effective emissivity ~0.85-0.90).
@@ -709,33 +712,46 @@ def spectral_humidCorr (wavelength, humidity, Tamb=None):
         xc = np.clip(x, 0.0, 1.0)
         return xc * xc * (3.0 - 2.0 * xc)
 
-    # 1. <= 7.80 µm: Continuous plateau across all short wavelengths (aligned with libRadtran)
-    m1 = w_um <= 7.80
-    h_corr[m1] = eps_plat
+    # 0. < 2.50 µm: Solar transparent window (high transmission, negligible thermal emission)
+    m0 = w_um < 2.50
+    h_corr[m0] = 0.0
 
-    # 2. 7.80 - 8.30 µm: Smooth roll-off from plateau into primary atmospheric window
-    m2 = (w_um > 7.80) & (w_um < 8.30)
-    s2 = _s((8.30 - w_um[m2]) / (8.30 - 7.80))
-    h_corr[m2] = eps_win + (eps_plat - eps_win) * s2
+    # 1. 2.50 - 3.00 µm: Opaque H2O/CO2 2.7 µm band (saturated absorption, eps = 1.0)
+    m1 = (w_um >= 2.50) & (w_um <= 3.00)
+    h_corr[m1] = 1.0
 
-    # 3. 8.30 - 12.50 µm: Primary atmospheric window with smooth Ozone 9.6 µm peak
+    # 2. 3.00 - 3.80 µm: Smooth transition wing from 2.7 µm band down to plateau
+    m2 = (w_um > 3.00) & (w_um < 3.80)
+    s2 = _s((3.80 - w_um[m2]) / (3.80 - 3.00))
+    h_corr[m2] = eps_plat + (1.0 - eps_plat) * s2
+
+    # 3. 3.80 - 7.80 µm: Continuous saturated plateau (libRadtran structure)
+    m3 = (w_um >= 3.80) & (w_um <= 7.80)
+    h_corr[m3] = eps_plat
+
+    # 4. 7.80 - 8.30 µm: Smooth roll-off from plateau into primary atmospheric window
+    m4 = (w_um > 7.80) & (w_um < 8.30)
+    s4 = _s((8.30 - w_um[m4]) / (8.30 - 7.80))
+    h_corr[m4] = eps_win + (eps_plat - eps_win) * s4
+
+    # 5. 8.30 - 12.50 µm: Primary atmospheric window with smooth Ozone 9.6 µm peak
     # Effective stratospheric ozone emission at ~215-225 K yields an effective downward emissivity of ~0.30
-    m3 = (w_um >= 8.30) & (w_um <= 12.50)
-    o3_peak = 0.30 * np.exp(-((w_um[m3] - 9.6) / 0.35)**2)
-    h_corr[m3] = np.maximum(eps_win, o3_peak)
+    m5 = (w_um >= 8.30) & (w_um <= 12.50)
+    o3_peak = 0.30 * np.exp(-((w_um[m5] - 9.6) / 0.35)**2)
+    h_corr[m5] = np.maximum(eps_win, o3_peak)
 
-    # 4. 12.50 - 13.50 µm: Smooth transition wing connecting from window level up to CO2 15 µm band (1.0)
-    m4 = (w_um > 12.50) & (w_um < 13.50)
-    s4 = _s((w_um[m4] - 12.50) / (13.50 - 12.50))
-    h_corr[m4] = eps_win + (1.0 - eps_win) * s4
+    # 6. 12.50 - 13.50 µm: Smooth transition wing connecting from window level up to CO2 15 µm band (1.0)
+    m6 = (w_um > 12.50) & (w_um < 13.50)
+    s6 = _s((w_um[m6] - 12.50) / (13.50 - 12.50))
+    h_corr[m6] = eps_win + (1.0 - eps_win) * s6
 
-    # 5. 13.50 - 16.50 µm: Opaque CO2 15 µm band
-    m5 = (w_um >= 13.50) & (w_um <= 16.50)
-    h_corr[m5] = 1.0
+    # 7. 13.50 - 16.50 µm: Opaque CO2 15 µm band
+    m7 = (w_um >= 13.50) & (w_um <= 16.50)
+    h_corr[m7] = 1.0
 
-    # 6. > 16.50 µm: Rotational water vapor bands with moisture-dependent optical depth
-    m6 = w_um > 16.50
-    h_corr[m6] = 0.42 + (1.0 - 0.42) * (1.0 - np.exp(-0.20 * e_hpa))
+    # 8. > 16.50 µm: Rotational water vapor bands with moisture-dependent optical depth
+    m8 = w_um > 16.50
+    h_corr[m8] = 0.42 + (1.0 - 0.42) * (1.0 - np.exp(-0.20 * e_hpa))
 
     h_corr = np.clip(h_corr, 0.0, 1.0)
 
