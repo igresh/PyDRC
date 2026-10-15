@@ -659,7 +659,50 @@ class emissivity_model(object):
         else:
             return self.step_emissivity(wavelength)
 
-def spectral_humidCorr (wavelength, humidity, Tamb=None):
+def spectral_humidCorr_tristram (wavelength, humidity):
+    """
+    Legacy empirical atmospheric humidity correction factor used by Tristram.
+    (Preserved from main git branch for backward compatibility / baseline comparisons).
+
+    Parameters:
+    -----------
+    wavelength : float or array-like
+        Wavelength in meters.
+    humidity : float
+        Relative humidity in % (0 - 100).
+
+    Returns:
+    --------
+    float or ndarray:
+        Emissivity correction factor:
+          - 0.1 - 2.5 µm: 0.0
+          - 2.5 - 13.0 µm: 0.005 * humidity
+          - > 13.0 µm: 1.0
+    """
+    wav = np.atleast_1d(wavelength)
+    h_corr = np.full_like(wav, np.nan, dtype=float)
+
+    visIR_mask = np.logical_and(wav >= 0.1e-6, wav <= 2.5e-6)
+    midIR_mask = np.logical_and(wav > 2.5e-6, wav <= 8e-6)
+    LWIR_mask = np.logical_and(wav > 8e-6, wav <= 13e-6)
+    # Wavelengths > 13 µm act as a blackbody in the atmosphere due to H2O/CO2 absorption
+    farIR_mask = wav > 13e-6
+
+    h_corr[visIR_mask] = 0
+    h_corr[midIR_mask] = 0.005 * humidity
+    h_corr[LWIR_mask] = 0.005 * humidity
+    h_corr[farIR_mask] = 1.0
+
+    if h_corr.size == 1:
+        return float(h_corr[0])
+    else:
+        return h_corr
+
+# Aliases for backward compatibility
+tristram_spectral_humidCorr = spectral_humidCorr_tristram
+spectral_humidCorr_legacy = spectral_humidCorr_tristram
+
+def spectral_humidCorr (wavelength, humidity, Tamb=None, model=None):
     """
     Physical spectral atmospheric emissivity model for clear skies.
     (Replaces the empirical correction factor used by Tristram: 0.005*humidity in 2.5-13 um, 1.0 above 13 um.)
@@ -685,7 +728,13 @@ def spectral_humidCorr (wavelength, humidity, Tamb=None):
     Tamb : float, optional
         Ambient air temperature in degrees Celsius. Defaults to 20.0 °C if not provided
         for backwards compatibility with 2-argument calls.
+    model : str, optional
+        Model to evaluate. Defaults to the calibrated physical model (Option B).
+        If 'Tristram', 'Tristram_legacy', or 'legacy', evaluates the legacy empirical Tristram model.
     """
+    if model in ('Tristram', 'Tristram_legacy', 'legacy', 'tristram'):
+        return spectral_humidCorr_tristram(wavelength, humidity)
+
     wav = np.atleast_1d(wavelength)
     w_um = wav * 1e6
     h_corr = np.zeros_like(wav, dtype=float)
