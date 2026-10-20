@@ -1,4 +1,5 @@
 import inspect
+import warnings
 import numpy as np
 import pvlib
 from scipy.interpolate import interp1d
@@ -35,8 +36,22 @@ class Surface(object):
                  insulation_thickness=None,
                  ground_h_eff=None,
                  ground_emissivity=0.95,
-                 thermal_emissivity=0.95):
+                 thermal_emissivity=0.95,
+                 use_iam=True,
+                 iam_ar=0.16,
+                 bezel_cutoff_angle=85.0,
+                 transposition_model='perez-driesse',
+                 use_effective_wind=False,
+                 wind_f_min=0.40,
+                 timezone='Australia/Sydney',
+                 decomposition_model='erbs_australia',
+                 min_diffuse_fraction=0.085):
         """
+        timezone (str): geographic timezone for solar calculations if dataset timestamps are naive (default 'Australia/Sydney').
+        decomposition_model (str): GHI to DNI/DHI decomposition model (default 'erbs_australia').
+            'erbs_australia' uses a continuous Australian low-turbidity modified Erbs model with lower clear-sky diffuse floor.
+            'erbs' uses standard Erbs (1982) with 0.165 clear-sky floor.
+        min_diffuse_fraction (float): clear-sky diffuse fraction floor for 'erbs_australia' (default 0.085).
         ground_h_eff (float or None): effective heat transfer coefficient of the surrounding ground,
             W/(m^2 K). Enables the GHI-driven ground temperature model (typ. 25-35 for concrete/paving).
             If None, the surroundings are assumed to be at ambient air temperature.
@@ -44,6 +59,17 @@ class Surface(object):
             The ground's solar albedo is taken from surrounds_albedo.
         thermal_emissivity (float): broadband thermal infrared emissivity (default 0.95).
             Used to populate the step emissivity model when spectral_absorptivity is None.
+        use_iam (bool): whether to apply angle-of-incidence modifiers (IAM) for solar reflection (default True).
+        iam_ar (float): angular losses coefficient for the Martin & Ruiz IAM model (default 0.16).
+            Lower values (0.10-0.13) model matte/textured/porous surfaces; higher values (0.18-0.25) model glossy/specular surfaces.
+        bezel_cutoff_angle (float or None): angle of incidence in degrees beyond which direct beam solar radiation
+            is shaded by the mounting frame/bezel lip (default 85.0 deg). Set to None or 90.0 to disable.
+        transposition_model (str): sky diffuse transposition model used by pvlib (default 'perez-driesse').
+            Options include 'perez-driesse', 'haydavies', 'reindl', 'isotropic', 'klucher', 'king'.
+            For equator-opposing (anti-solar) tilted surfaces, 'haydavies' or 'reindl' avoids fictitious horizon brightening.
+        use_effective_wind (bool): whether to calculate and use effective wind speed accounting for
+            windward vs. leeward wake sheltering behind tilted panels (default False).
+        wind_f_min (float): minimum wind speed fraction in a direct leeward wake (default 0.40).
         """
         self._solar_reflectivity = float(solar_reflectivity) if solar_reflectivity is not None else 0.95
         self._thermal_emissivity = float(thermal_emissivity) if thermal_emissivity is not None else 0.95
@@ -91,6 +117,27 @@ class Surface(object):
         self.insulation_thickness = insulation_thickness
         self.ground_h_eff = ground_h_eff
         self.ground_emissivity = ground_emissivity
+        self.use_iam = use_iam
+        self.iam_ar = float(iam_ar) if iam_ar is not None else 0.16
+        self.bezel_cutoff_angle = float(bezel_cutoff_angle) if bezel_cutoff_angle is not None else None
+        self.transposition_model = str(transposition_model) if transposition_model is not None else 'perez-driesse'
+        self.use_effective_wind = bool(use_effective_wind)
+        self.wind_f_min = float(wind_f_min) if wind_f_min is not None else 0.40
+        self.timezone = str(timezone) if timezone is not None else 'Australia/Sydney'
+        self.decomposition_model = str(decomposition_model) if decomposition_model is not None else 'erbs_australia'
+        self.min_diffuse_fraction = float(min_diffuse_fraction) if min_diffuse_fraction is not None else 0.085
+
+        # Warn if non-zero panel tilt is used with the Perez transposition model
+        if abs(float(self.tilt)) > 1e-3 and 'perez' in str(self.transposition_model).lower():
+            warnings.warn(
+                f"Using transposition_model='{self.transposition_model}' with a non-zero panel tilt ({self.tilt}°). "
+                "The Perez model assumes isotropic horizon brightening across all azimuths, which can overestimate "
+                "diffuse irradiance on tilted surfaces (especially those facing away from the equator). "
+                "Consider using 'haydavies' or 'reindl' instead.",
+                UserWarning,
+                stacklevel=2
+            )
+            self._perez_tilt_warned = True
 
     @property
     def solar_reflectivity(self):
@@ -318,25 +365,204 @@ class SurfaceSimulator(object):
 
         return sim_df
 
-def calculate_plane_of_array_irradiance(surface, times, exp_ghi):
-    # Would be nice to have a way to account for the loss of dhi due to surrounding buildings etc
-    # raising the horizon.
-    solar_pos = pvlib.solarposition.get_solarposition(time=times, latitude=surface.latitude, longitude=surface.longitude)
-    dni_extra = pvlib.irradiance.get_extra_radiation(times)
-    erbs = pvlib.irradiance.erbs(exp_ghi, solar_pos['zenith'], times)
 
-    return pvlib.irradiance.get_total_irradiance(
+def erbs_australia(ghi, solar_zenith, times, min_df=0.085, min_cos_zenith=0.065, max_zenith=87.0):
+    """
+    Continuous Modified Erbs decomposition model adapted for low-turbidity
+    Australian atmospheres.
+
+    For overcast / cloudy skies (kt <= 0.22), behaves identically to standard Erbs (1982).
+    For clear Australian skies (kt >= 0.80), plateaus at min_df (default 0.085 = 8.5% diffuse,
+    compared to 0.165 in standard Erbs).
+    For intermediate skies (0.22 < kt < 0.80), a C1-continuous cubic Hermite spline smoothly
+    bridges the overcast slope (-0.09) and the clear-sky floor (0.0) with no kinks or discontinuities.
+    """
+    dni_extra = pvlib.irradiance.get_extra_radiation(times)
+    kt = pvlib.irradiance.clearness_index(ghi, solar_zenith, dni_extra,
+                                          min_cos_zenith=min_cos_zenith,
+                                          max_clearness_index=1.0)
+
+    kt_arr = np.asarray(kt, dtype=float)
+    df = np.empty_like(kt_arr)
+
+    # 1. Overcast / Cloudy Skies (kt <= 0.22) - identical to Erbs (1982)
+    m1 = kt_arr <= 0.22
+    df[m1] = 1.0 - 0.09 * kt_arr[m1]
+
+    # 2. Crisp Clear Australian Skies (kt >= 0.80)
+    m3 = kt_arr >= 0.80
+    df[m3] = min_df
+
+    # 3. Intermediate Skies (0.22 < kt < 0.80) - C1-continuous Hermite spline
+    m2 = (~m1) & (~m3)
+    if np.any(m2):
+        k = kt_arr[m2]
+        L = 0.80 - 0.22
+        u = (k - 0.22) / L
+
+        y0 = 1.0 - 0.09 * 0.22   # 0.9802
+        y1 = min_df
+        dy0 = -0.09 * L          # -0.0522
+        dy1 = 0.0
+
+        h00 = 2.0 * (u**3) - 3.0 * (u**2) + 1.0
+        h10 = (u**3) - 2.0 * (u**2) + u
+        h01 = -2.0 * (u**3) + 3.0 * (u**2)
+
+        df[m2] = y0 * h00 + dy0 * h10 + y1 * h01
+
+    dhi = df * ghi
+    cos_z = np.cos(np.deg2rad(solar_zenith))
+    dni = np.maximum(0.0, (ghi - dhi) / np.maximum(cos_z, 0.05))
+
+    bad_values = (solar_zenith > max_zenith) | (ghi <= 0.0)
+    dni = np.where(bad_values, 0.0, dni)
+    dhi = np.where(bad_values, ghi, dhi)
+
+    res = pd.DataFrame({'dni': dni, 'dhi': dhi, 'kt': kt}, index=times if hasattr(times, '__iter__') else None)
+    return res
+
+
+_DEFAULT_CUTOFF = object()
+
+def calculate_plane_of_array_irradiance(surface, times, exp_ghi, use_iam=None, iam_ar=None,
+                                        bezel_cutoff_angle=_DEFAULT_CUTOFF, transposition_model=None,
+                                        decomposition_model=None, min_diffuse_fraction=None):
+    """
+    Calculates plane-of-array (POA) solar irradiance on a tilted surface using pvlib.
+
+    When use_iam=True (default, or inherited from surface.use_iam), accounts for
+    angle-dependent Fresnel reflection using the Martin & Ruiz (M&R) IAM model:
+      - Direct beam: pvlib.iam.martin_ruiz(aoi, a_r=a_r)
+      - Sky & Ground diffuse: pvlib.iam.martin_ruiz_diffuse(surface.tilt, a_r=a_r)
+    The angular loss parameter a_r is taken from iam_ar or surface.iam_ar (default 0.16).
+
+    Direct beam obstruction from sample holder bezels/lips is clamped to zero when
+    AOI >= bezel_cutoff_angle (default 85.0 deg, inherited from surface.bezel_cutoff_angle).
+
+    The transposition model for sky diffuse irradiance is taken from transposition_model
+    or surface.transposition_model (default 'perez-driesse'; 'haydavies' or 'reindl' recommended
+    for surfaces tilted away from the sun).
+
+    The decomposition model for splitting GHI into DNI and DHI is taken from decomposition_model
+    or surface.decomposition_model (default 'erbs_australia' with min_diffuse_fraction=0.085;
+    set to 'erbs' for standard Erbs (1982)).
+    """
+    if use_iam is None:
+        use_iam = getattr(surface, 'use_iam', True)
+
+    if bezel_cutoff_angle is _DEFAULT_CUTOFF:
+        bezel_cutoff_angle = getattr(surface, 'bezel_cutoff_angle', 85.0)
+
+    if transposition_model is None:
+        transposition_model = getattr(surface, 'transposition_model', 'perez-driesse')
+
+    if decomposition_model is None:
+        decomposition_model = getattr(surface, 'decomposition_model', 'erbs_australia')
+
+    if min_diffuse_fraction is None:
+        min_diffuse_fraction = getattr(surface, 'min_diffuse_fraction', 0.085)
+
+    # Warn if non-zero panel tilt is used with the Perez transposition model
+    tilt_val = getattr(surface, 'tilt', 0.0)
+    if abs(float(tilt_val)) > 1e-3 and 'perez' in str(transposition_model).lower():
+        if not getattr(surface, '_perez_tilt_warned', False):
+            warnings.warn(
+                f"Using transposition_model='{transposition_model}' with a non-zero panel tilt ({tilt_val}°). "
+                "The Perez model assumes isotropic horizon brightening across all azimuths, which can overestimate "
+                "diffuse irradiance on tilted surfaces (especially those facing away from the equator). "
+                "Consider using 'haydavies' or 'reindl' instead.",
+                UserWarning,
+                stacklevel=2
+            )
+
+    # Ensure times are localized if naive, defaulting to surface timezone
+    times_orig = times
+    times_calc = times
+    if isinstance(times, pd.DatetimeIndex) and times.tz is None:
+        tz = getattr(surface, 'timezone', 'Australia/Sydney')
+        times_calc = times.tz_localize(tz)
+    elif hasattr(times, 'dt') and hasattr(times.dt, 'tz') and times.dt.tz is None:
+        tz = getattr(surface, 'timezone', 'Australia/Sydney')
+        times_calc = times.dt.tz_localize(tz)
+
+    solar_pos = pvlib.solarposition.get_solarposition(time=times_calc, latitude=surface.latitude, longitude=surface.longitude)
+    dni_extra = pvlib.irradiance.get_extra_radiation(times_calc)
+    exp_ghi_calc = exp_ghi
+    if isinstance(exp_ghi, pd.Series) and isinstance(exp_ghi.index, pd.DatetimeIndex) and exp_ghi.index.tz is None and getattr(times_calc, 'tz', None) is not None:
+        exp_ghi_calc = pd.Series(exp_ghi.values, index=times_calc)
+
+    # GHI to DNI / DHI decomposition
+    if decomposition_model == 'erbs_australia':
+        decomp = erbs_australia(exp_ghi_calc, solar_pos['zenith'], times_calc, min_df=min_diffuse_fraction)
+    elif decomposition_model == 'erbs':
+        decomp = pvlib.irradiance.erbs(exp_ghi_calc, solar_pos['zenith'], times_calc)
+    elif callable(decomposition_model):
+        decomp = decomposition_model(exp_ghi_calc, solar_pos['zenith'], times_calc)
+    else:
+        raise ValueError(f"Unknown decomposition_model: '{decomposition_model}'. Options are 'erbs_australia', 'erbs', or a callable.")
+
+    poa = pvlib.irradiance.get_total_irradiance(
             surface_tilt=surface.tilt,
             surface_azimuth=surface.azimuth, # south
             solar_zenith=solar_pos['apparent_zenith'],
             solar_azimuth=solar_pos['azimuth'],
-            dni=erbs['dni'],
-            ghi=exp_ghi,
-            dhi=erbs['dhi'],
+            dni=decomp['dni'],
+            ghi=exp_ghi_calc,
+            dhi=decomp['dhi'],
             dni_extra=dni_extra,
-            model='perez-driesse',
+            model=transposition_model,
             albedo=surface.surrounds_albedo
-            )['poa_global']
+            )
+
+    # Time-varying angle of incidence for direct beam
+    aoi = pvlib.irradiance.aoi(
+        surface_tilt=surface.tilt,
+        surface_azimuth=surface.azimuth,
+        solar_zenith=solar_pos['apparent_zenith'],
+        solar_azimuth=solar_pos['azimuth']
+    )
+
+    if not use_iam:
+        if bezel_cutoff_angle is not None and bezel_cutoff_angle < 90.0:
+            poa_direct = poa['poa_direct'].copy()
+            if isinstance(poa_direct, pd.Series):
+                poa_direct = poa_direct.where(aoi < bezel_cutoff_angle, 0.0)
+            else:
+                poa_direct = np.where(aoi >= bezel_cutoff_angle, 0.0, poa_direct)
+            res = poa_direct + poa['poa_diffuse']
+        else:
+            res = poa['poa_global']
+        if isinstance(res, (pd.Series, pd.DataFrame)) and res.index is not times_orig:
+            res.index = times_orig
+        return res
+
+    # Angular loss parameter for Martin & Ruiz model
+    if iam_ar is None:
+        iam_ar = getattr(surface, 'iam_ar', 0.16)
+
+    # 1. Exact tilt-dependent diffuse IAMs (Martin & Ruiz)
+    iam_sky, iam_ground = pvlib.iam.martin_ruiz_diffuse(surface.tilt, a_r=iam_ar)
+
+    # Direct beam IAM using Martin & Ruiz model
+    iam_beam = pvlib.iam.martin_ruiz(aoi, a_r=iam_ar)
+
+    # Bezel shading cut-off (direct beam blocked by mounting frame lip at high AOI)
+    if bezel_cutoff_angle is not None and bezel_cutoff_angle < 90.0:
+        if isinstance(iam_beam, pd.Series):
+            iam_beam = iam_beam.where(aoi < bezel_cutoff_angle, 0.0)
+        else:
+            iam_beam = np.where(aoi >= bezel_cutoff_angle, 0.0, iam_beam)
+
+    # 3. Angle-corrected effective plane-of-array irradiance
+    poa_effective = (
+        poa['poa_direct'] * iam_beam +
+        poa['poa_sky_diffuse'] * iam_sky +
+        poa['poa_ground_diffuse'] * iam_ground
+    )
+    if isinstance(poa_effective, (pd.Series, pd.DataFrame)) and poa_effective.index is not times_orig:
+        poa_effective.index = times_orig
+    return poa_effective
 
 
 class equil_solver(object):
@@ -404,7 +630,42 @@ def make_dataframe(df_section, surface):
     new_df['Tsurf'] = df_section[(surface.name, 'Temp avg delta')] + df_section[('General', 'Air temp, ˚C')]
     new_df['Tamb'] = df_section[('General', 'Air temp, ˚C')]
     new_df['Humidity'] = df_section[('General', 'RH, %')]
-    new_df['Windspeed'] = df_section[('General', 'Windspeed, m/s')]
+    # Wind speed and optional wind direction / effective wind speed
+    raw_windspeed = df_section[('General', 'Windspeed, m/s')]
+    new_df['Windspeed'] = raw_windspeed
+    new_df['Windspeed_raw'] = raw_windspeed
+
+    wind_dir_col = None
+    for candidate in [
+        ('General', 'WindDir, ˚deg'),
+        ('General', 'Wind direction, ˚'),
+        ('General', 'Wind direction, deg'),
+        ('General', 'Wind direction'),
+        ('General', 'WindDir'),
+        ('General', 'Wind dir, ˚'),
+        ('General', 'Wind dir'),
+        ('ERA5_Weather', 'Wind direction, ˚'),
+        ('ERA5_Weather', 'Wind direction'),
+    ]:
+        if candidate in df_section.columns:
+            wind_dir_col = candidate
+            break
+
+    if wind_dir_col is not None:
+        new_df['Wind direction'] = df_section[wind_dir_col]
+        f_min = getattr(surface, 'wind_f_min', 0.40)
+        v_eff = calculate_effective_wind_speed(
+            wind_speed=raw_windspeed,
+            wind_direction=new_df['Wind direction'],
+            surface_azimuth=surface.azimuth,
+            tilt=surface.tilt,
+            f_min=f_min
+        )
+        new_df['Effective windspeed, m/s'] = v_eff
+        new_df['Windspeed_effective'] = v_eff
+        if getattr(surface, 'use_effective_wind', False):
+            new_df['Windspeed'] = v_eff
+
     era5_cloud = df_section[('ERA5_Weather', 'Total cloud cover, fraction')]
     daylight_series = None
     if hasattr(df_section, 'Category') and hasattr(df_section.Category, '__getitem__') and 'Daylight' in df_section.Category:
@@ -422,6 +683,7 @@ def make_dataframe(df_section, surface):
     new_df['GHI'] = df_section[('General', 'Solar flux density, W/m^2')]
     new_df['irradiance on tilted panels'] = calculate_plane_of_array_irradiance(surface=surface,
                                                                                  times=df_section.index,
+                                                                                 bezel_cutoff_angle=surface.bezel_cutoff_angle,
                                                                                  exp_ghi=df_section[('General', 'Solar flux density, W/m^2')])
     
     dew_col = (surface.name, 'Dew collected, mL/m^2')
@@ -451,6 +713,59 @@ def make_dataframe(df_section, surface):
     return new_df
 
 ## -----------
+def calculate_effective_wind_speed(wind_speed, wind_direction, surface_azimuth=180.0, tilt=0.0, f_min=0.40):
+    """
+    Calculates the effective local wind speed over an inclined surface, accounting for
+    windward impingement vs. leeward wake separation (sheltering behind the tilted panel).
+
+    Parameters:
+    -----------
+    wind_speed : float, np.ndarray, or pd.Series
+        Free-stream wind speed in m/s.
+    wind_direction : float, np.ndarray, or pd.Series
+        Meteorological wind direction in degrees from North (0-360 deg: 0 = North, 90 = East, 180 = South, 270 = West).
+    surface_azimuth : float, default 180.0
+        Surface facing direction (degrees from North, 180 = South).
+    tilt : float, default 0.0
+        Surface tilt angle in degrees from horizontal.
+    f_min : float, default 0.40
+        Minimum wind fraction in a direct leeward wake (default 0.40, based on Loveday & Taki / DOE-2).
+
+    Returns:
+    --------
+    v_eff : float, np.ndarray, or pd.Series
+        Effective wind speed in m/s.
+    """
+    if wind_direction is None:
+        return wind_speed
+
+    # Relative angle between wind approach vector and surface azimuth in radians
+    delta_gamma = np.radians((wind_direction - surface_azimuth + 180.0) % 360.0 - 180.0)
+
+    # Windward alignment factor: 1.0 (head-on windward) down to 0.0 (direct leeward from behind)
+    u = (1.0 + np.cos(delta_gamma)) / 2.0
+
+    # Scale wake depth with panel tilt: horizontal panels (tilt=0) have no bluff-body wake;
+    # flow over an inclined plate reaches full aerodynamic wake separation by tilt >= 20 deg
+    tilt_deg = np.clip(tilt, 0.0, 90.0)
+    tilt_ramp = np.clip(tilt_deg / 20.0, 0.0, 1.0)
+    f_min_eff = 1.0 - (1.0 - f_min) * tilt_ramp
+
+    reduction_factor = f_min_eff + (1.0 - f_min_eff) * u
+    v_eff = wind_speed * reduction_factor
+
+    if isinstance(v_eff, pd.Series):
+        return v_eff.combine_first(wind_speed)
+    elif isinstance(v_eff, np.ndarray):
+        nan_mask = np.isnan(v_eff)
+        if np.any(nan_mask):
+            v_eff = v_eff.copy()
+            v_eff[nan_mask] = np.asarray(wind_speed)[nan_mask]
+        return v_eff
+    elif np.isnan(v_eff):
+        return wind_speed
+    return v_eff
+
 def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
     """
     Computes natural convection heat transfer coefficient.
@@ -477,7 +792,7 @@ def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
         # Approximate scaling factor for air at standard temperature: 1.6e8
         Ra_L = 1.6e8 * abs_delta_T * (char_length ** 3)
         
-        # Horizontal plate component
+        # Horizontal plate component (characteristic length L_c = As / P = char_length)
         if is_unstable:
             if Ra_L < 1e7:
                 h_nat_horiz = 1.32 * ((abs_delta_T / char_length) ** 0.25)
@@ -486,9 +801,11 @@ def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
         else:
             h_nat_horiz = 0.59 * ((abs_delta_T / char_length) ** 0.25)
             
-        # Vertical plate component
-        if Ra_L < 1e9:
-            h_nat_vert = 1.42 * ((abs_delta_T / char_length) ** 0.25)
+        # Vertical plate component (characteristic length L_vert = 4 * As / P = 4 * char_length)
+        L_vert = 4.0 * char_length
+        Ra_L_vert = 1.6e8 * abs_delta_T * (L_vert ** 3)
+        if Ra_L_vert < 1e9:
+            h_nat_vert = 1.42 * ((abs_delta_T / L_vert) ** 0.25)
         else:
             h_nat_vert = 1.31 * (abs_delta_T ** (1/3))
             
@@ -529,16 +846,16 @@ def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, mod
         h_nat = get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=char_length)
         
     # Scale forced components by (L_ref / L)^0.5
-    # The reference length L_ref corresponds to the characteristic length of the panels in the base study.
-    # Maestre-Valero: 1.0 m square foils -> L_ref = As/P = 0.25 m
-    # Richards / Sharples: building roofs / large walls -> L_ref = 1.0 m
+    # The reference length L_ref corresponds to the characteristic length L = As/P of the panels in the base study.
+    # Maestre-Valero / Richards: 1.0 m square condenser foils -> L_ref = As/P = 0.25 m
+    # Sharples: 1.8 m x 0.9 m solar collector -> L_ref = As/P = 0.30 m
     if model == 'Combined-TARP-Maestre':
         L_ref = 0.25
         forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
         forced_term = 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
         return h_nat + forced_term * forced_scale
     elif model == 'Combined-TARP-Richards':
-        L_ref = 1.0
+        L_ref = 0.25
         forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
         forced_term = 4.1 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
         return h_nat + forced_term * forced_scale
