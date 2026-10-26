@@ -39,8 +39,7 @@ pip install numpy scipy pandas matplotlib pvlib
 Clone the repository and import `Model` directly in your scripts or Jupyter notebooks:
 
 ```bash
-git clone https://github.com/<your-org>/PyDRC.git
-cd PyDRC
+git clone https://github.com/igresh/PyDRC.git
 ```
 
 ---
@@ -50,6 +49,7 @@ cd PyDRC
 ### 1. Define a Radiative Cooling Surface
 
 ```python
+sys.path.append('<path_to_PyDRC_repo>/PyDRC')
 import Model
 
 # Define a 500 mm x 500 mm PDRC panel tilted at 30° facing South (azimuth = 180°)
