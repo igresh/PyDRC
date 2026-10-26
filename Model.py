@@ -31,6 +31,7 @@ class Surface(object):
                  density=2710,
                  convection_model='Maestre-Valero',
                  char_length=None,
+                 boundary_layer='laminar',
                  back_conductance=0.0,
                  insulation_conductivity=None,
                  insulation_thickness=None,
@@ -47,6 +48,8 @@ class Surface(object):
                  decomposition_model='erbs_australia',
                  min_diffuse_fraction=0.085):
         """
+        boundary_layer (str or float): boundary-layer scaling regime for characteristic-length forced convection
+            in Combined-TARP models (default 'laminar' -> exponent 0.5; 'turbulent' -> exponent 0.2; or float).
         timezone (str): geographic timezone for solar calculations if dataset timestamps are naive (default 'Australia/Sydney').
         decomposition_model (str): GHI to DNI/DHI decomposition model (default 'erbs_australia').
             'erbs_australia' uses a continuous Australian low-turbidity modified Erbs model with lower clear-sky diffuse floor.
@@ -112,6 +115,7 @@ class Surface(object):
         self._sky_view_factor = sky_view_factor
         self.convection_model = convection_model
         self.char_length = char_length
+        self.boundary_layer = boundary_layer
         self._back_conductance = back_conductance
         self.insulation_conductivity = insulation_conductivity
         self.insulation_thickness = insulation_thickness
@@ -266,7 +270,8 @@ class SurfaceSimulator(object):
         irrad = self.interp_Psolar(t)
 
         heat_cap_surf = 1/(self.surface.heat_cap_per_m2+condensed_mass*self.heatcap_water)
-        cond_rate = deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length)
+        bl_mode = getattr(self.surface, 'boundary_layer', 'laminar')
+        cond_rate = deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length, boundary_layer=bl_mode)
         dmdt = cond_rate-0.01*condensed_mass #I think this is just hacking in an evaporation rate?
         dcdt = 0.01*condensed_mass # c represents cumulative evaporated mass
 
@@ -282,7 +287,7 @@ class SurfaceSimulator(object):
             reflectivity=self.surface.solar_reflectivity, radht=self.Prad_function, cloud_cover=self.interp_cloud(t),
             cond_rate=cond_rate, model=self.surface.convection_model, char_length=self.surface.char_length,
             back_conductance=getattr(self.surface, 'back_conductance', 0.0),
-            ghi=self._ghi(t), strd=strd_val
+            ghi=self._ghi(t), strd=strd_val, boundary_layer=bl_mode
         )
         return [dmdt,dTdt,dcdt]
 
@@ -310,12 +315,13 @@ class SurfaceSimulator(object):
 
         # Calculate condensation rate
         cond_rates = []
+        bl_mode = getattr(self.surface, 'boundary_layer', 'laminar')
         for t, Tsurf in zip(t_exp, sim_df['Theory - Tsurf']):
             Tamb = self.interp_Tamb(t)
             pressure = self.interp_pres(t)
             windspeed = self.interp_wspd(t)
             humidity = self.interp_Humid(t)
-            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length))
+            cond_rates.append(deriv_m(Tamb, humidity, Tsurf, windspeed, pressure, tilt=self.surface.tilt, model=self.surface.convection_model, char_length=self.surface.char_length, boundary_layer=bl_mode))
         sim_df['Theory - cond rate'] = np.array(cond_rates)
 
         # Modelled ground temperature (equals Tamb if ground_h_eff is None or GHI unavailable).
@@ -794,20 +800,22 @@ def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
         
         # Horizontal plate component (characteristic length L_c = As / P = char_length)
         if is_unstable:
-            if Ra_L < 1e7:
-                h_nat_horiz = 1.32 * ((abs_delta_T / char_length) ** 0.25)
-            else:
-                h_nat_horiz = 1.52 * (abs_delta_T ** (1/3))
+            h_lam = 1.32 * ((abs_delta_T / char_length) ** 0.25)
+            h_turb = 1.52 * (abs_delta_T ** (1/3))
+            # Smooth C^1 logistic blend across transition band around Ra_L = 1e7
+            w_h = 1.0 / (1.0 + np.exp(-np.log10(np.maximum(Ra_L, 1e-10) / 1e7) / 0.20))
+            h_nat_horiz = (1.0 - w_h) * h_lam + w_h * h_turb
         else:
             h_nat_horiz = 0.59 * ((abs_delta_T / char_length) ** 0.25)
             
         # Vertical plate component (characteristic length L_vert = 4 * As / P = 4 * char_length)
         L_vert = 4.0 * char_length
         Ra_L_vert = 1.6e8 * abs_delta_T * (L_vert ** 3)
-        if Ra_L_vert < 1e9:
-            h_nat_vert = 1.42 * ((abs_delta_T / L_vert) ** 0.25)
-        else:
-            h_nat_vert = 1.31 * (abs_delta_T ** (1/3))
+        hv_lam = 1.42 * ((abs_delta_T / L_vert) ** 0.25)
+        hv_turb = 1.31 * (abs_delta_T ** (1/3))
+        # Smooth C^1 logistic blend across transition band around Ra_L_vert = 1e9
+        w_v = 1.0 / (1.0 + np.exp(-np.log10(np.maximum(Ra_L_vert, 1e-10) / 1e9) / 0.20))
+        h_nat_vert = (1.0 - w_v) * hv_lam + w_v * hv_turb
             
         # Interpolate based on tilt angle
         sin_theta = np.sin(theta)
@@ -821,7 +829,7 @@ def get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=None):
         
     return h_nat
 
-def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, model='Maestre-Valero', char_length=None):
+def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, model='Maestre-Valero', char_length=None, boundary_layer='laminar'):
     """
     Calculates convective heat transfer coefficient.
     T_surface: Surface temperature in Celsius
@@ -829,6 +837,8 @@ def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, mod
     T_ambient: Ambient air temperature in Celsius (optional, required for Combined-TARP models)
     tilt: Panel tilt angle in degrees (optional, required for Combined-TARP models)
     char_length: Characteristic length L = As/P in meters (optional, triggers size-dependent scaling)
+    boundary_layer: Forced convection boundary-layer scaling regime ('laminar' -> 0.5 default,
+        'turbulent' -> 0.2, 'none' -> 0.0, or a numeric exponent).
     """
     if model == 'Maestre-Valero':
         T_ref = T_ambient if T_ambient is not None else T_surface
@@ -844,33 +854,44 @@ def conv_heat_transfer_coeff(T_surface, windspeed, T_ambient=None, tilt=0.0, mod
         h_nat = 0.0
     else:
         h_nat = get_tarp_natural_convection(T_surface, T_ambient, tilt, char_length=char_length)
+
+    if isinstance(boundary_layer, (int, float)):
+        exp = float(boundary_layer)
+    elif boundary_layer is None or str(boundary_layer).lower() == 'none':
+        exp = 0.0
+    elif str(boundary_layer).lower() == 'turbulent':
+        exp = 0.2
+    elif str(boundary_layer).lower() == 'laminar':
+        exp = 0.5
+    else:
+        raise ValueError(f"Unknown boundary_layer: {boundary_layer}. Expected 'laminar' (0.5), 'turbulent' (0.2), 'none' (0.0), or a float.")
         
-    # Scale forced components by (L_ref / L)^0.5
+    # Scale forced components by (L_ref / L)^exp (default exp = 0.5 for laminar boundary layer)
     # The reference length L_ref corresponds to the characteristic length L = As/P of the panels in the base study.
     # Maestre-Valero / Richards: 1.0 m square condenser foils -> L_ref = As/P = 0.25 m
     # Sharples: 1.8 m x 0.9 m solar collector -> L_ref = As/P = 0.30 m
     if model == 'Combined-TARP-Maestre':
         L_ref = 0.25
-        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_scale = (L_ref / char_length) ** exp if (char_length is not None and char_length > 0.0) else 1.0
         forced_term = 6.6 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
         return h_nat + forced_term * forced_scale
     elif model == 'Combined-TARP-Richards':
         L_ref = 0.25
-        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_scale = (L_ref / char_length) ** exp if (char_length is not None and char_length > 0.0) else 1.0
         forced_term = 4.1 * windspeed * (511 + 294) / (511 + T_surface + 273.15)
         return h_nat + forced_term * forced_scale
     elif model == 'Combined-TARP-Sharples':
         # Sharples (1998) used a 1.8m x 0.9m flat plate solar collector.
         # For a 1.8m x 0.9m panel: L_ref = As/P = (1.8 * 0.9) / (2 * (1.8 + 0.9)) = 0.3 m.
         L_ref = 0.3
-        forced_scale = (L_ref / char_length) ** 0.5 if (char_length is not None and char_length > 0.0) else 1.0
+        forced_scale = (L_ref / char_length) ** exp if (char_length is not None and char_length > 0.0) else 1.0
         forced_term = 2.5 * windspeed
         return h_nat + forced_term * forced_scale
     else:
         raise ValueError(f'Unknown model: {model}')
 
-def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero', char_length=None):
-    hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length)
+def Pconvection(T_amb, T_surf, windspeed, tilt=0.0, model='Maestre-Valero', char_length=None, boundary_layer='laminar'):
+    hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length, boundary_layer=boundary_layer)
     return hc * (T_amb - T_surf)
 
 def Pconduction(T_amb, T_surf, back_conductance=0.0):
@@ -881,12 +902,12 @@ def Pconduction(T_amb, T_surf, back_conductance=0.0):
     """
     return back_conductance * (T_amb - T_surf)
 
-def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero', char_length=None):
+def deriv_m(T_amb, H, T_surf, windspeed, p, tilt=0.0, model='Maestre-Valero', char_length=None, boundary_layer='laminar'):
     Ca = 1005
 
     Tdew = Tdewpoint(T_amb, H)
     if T_surf <= Tdew:
-        hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length)
+        hc = conv_heat_transfer_coeff(T_surface=T_surf, windspeed=windspeed, T_ambient=T_amb, tilt=tilt, model=model, char_length=char_length, boundary_layer=boundary_layer)
         val = ((hc * 0.622) / (Ca * p)) * (VPsat(Tdew) - VPsat(T_surf))
     else:
         val = 0
@@ -1336,7 +1357,7 @@ class ThermalHeatTransfer (object):
 
 
 
-def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None, back_conductance=None, ghi=None, strd=None):
+def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, humidity, windspeed, cloud_cover, cond_rate=0, model='Maestre-Valero', char_length=None, back_conductance=None, ghi=None, strd=None, boundary_layer=None):
     """
     The objective function that we want to equal zero.
     Calculates the net heat flux for a given guess of surface temperature (Tc_guess).
@@ -1344,6 +1365,7 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
          If None, the ground is assumed to be at ambient temperature.
     strd: downwelling longwave radiation (W/m^2) from ERA5 or pyrgeometer.
           If provided, scales the incident sky spectrum directly.
+    boundary_layer: forced convection boundary-layer scaling ('laminar' -> 0.5 default, 'turbulent' -> 0.2).
     """
     Lv = 2256*1e3 # latent heat of vapourisation
 
@@ -1351,7 +1373,12 @@ def heat_balance_equation(Tsurf_guess, Tamb, irradiance, reflectivity, radht, hu
     P_rad = radht(T_surf=Tsurf_guess[0], T_amb=Tamb, humidity=humidity, cloud_cover=cloud_cover, ghi=ghi, strd=strd)
     P_sol = (1 - reflectivity) * irradiance
     tilt = radht.surface.tilt if (hasattr(radht, 'surface') and radht.surface is not None) else 0.0
-    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model, char_length=char_length)
+    if boundary_layer is None:
+        if hasattr(radht, 'surface') and radht.surface is not None:
+            boundary_layer = getattr(radht.surface, 'boundary_layer', 'laminar')
+        else:
+            boundary_layer = 'laminar'
+    P_conv = Pconvection(Tamb, Tsurf_guess[0], windspeed, tilt=tilt, model=model, char_length=char_length, boundary_layer=boundary_layer)
     P_lat = Lv * cond_rate # 0, unless condensation rate provided
 
     # Conductive heat flux through insulation with ambient air (T_boundary = T_amb)
