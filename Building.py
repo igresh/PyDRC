@@ -1,9 +1,9 @@
 """
-Building.py: a simple single-zone house with a radiatively-cooled (or not) roof.
+Building.py: a simple single-storey house with a ventilated attic and a radiatively-cooled (or not) roof.
 
 Couples the PyDRC roof-surface physics in Model.py (spectral long-wave exchange with the sky,
-solar absorption, convection) to a lumped indoor-air node, so the effect of roof paint on
-indoor temperature can be shown "all other things being equal".
+solar absorption, convection) to lumped attic-air and indoor-air nodes, so the effect of roof
+paint on indoor temperature can be shown "all other things being equal".
 
 Thermal network (per house)
 ---------------------------
@@ -12,24 +12,32 @@ Thermal network (per house)
             \        |           /
      [ roof outer surface, T_roof ]  -- C_roof (per m² roof)
                      |
-               U_roof (roof + ceiling + insulation, outer surface -> indoor air)
+               U_roof_attic (roofing + underside film, per m² roof)
+                     |
+     [ attic air, T_attic ]  -- C_attic          ---- attic ventilation (rho cp V_attic ACH) to T_amb
+                     |
+               U_ceiling (ceiling + insulation, per m² floor)
                      |
      [ indoor air + furnishings, T_in ]  -- C_in
           |                 |                |
      walls & windows    ventilation     internal + window solar gains
        (UA to T_amb)   (rho cp V ACH)
 
-Roof surface balance (W per m² of roof):
-    0 = (1-R)·G  +  P_rad(T_roof)  +  h_c·(T_amb - T_roof)  +  U_roof·(T_in - T_roof)
-Indoor node (W):
-    C_in dT_in/dt = U_roof·A_roof·(T_roof - T_in) + K_amb·(T_amb - T_in) + Q_internal + Q_window
+Roof surface (W per m² roof):
+    C_roof dT_roof/dt = (1-R)·G + P_rad(T_roof) + h_c·(T_amb - T_roof) + U_ra·(T_attic - T_roof)
+Attic air (W):
+    C_attic dT_attic/dt = U_ra·A_roof·(T_roof - T_attic) + K_attic_vent·(T_amb - T_attic) + U_c·A_floor·(T_in - T_attic)
+Indoor air (W):
+    C_in dT_in/dt = U_c·A_floor·(T_attic - T_in) + K_amb·(T_amb - T_in) + Q_internal + Q_window
 
 P_rad and h_c come straight from Model.ThermalHeatTransfer and Model.Pconvection.
+The insulation sits on the ceiling (between attic and house), not under the roof sheeting.
 
 Simplifications (deliberate, for a clear "same house, different roof" comparison):
   * Irradiance on the roof is taken as GHI (a pitched roof's two slopes roughly average to this).
   * Walls are treated as being at air temperature on the outside (no wall sol-air heating).
-  * The attic/ceiling cavity is lumped into a single roof U-value.
+  * Radiation from the roof underside to the top of the ceiling is lumped into U_roof_attic
+    (i.e. it is treated as heating the attic node), and there is no reflective foil / sarking.
 """
 
 import numpy as np
@@ -51,18 +59,19 @@ PAINTS = {
     'cool':       dict(name='Cool paint (PDRC)', solar_reflectivity=0.96, thermal_emissivity=0.95),
 }
 
-# Roof U-values, outer roof surface -> indoor air, W/(m²·K) per m² of roof.
+# Ceiling U-values, attic air -> indoor air (incl. both air films), W/(m²·K) per m² of floor.
 INSULATION = {
-    'none': 5.0,   # single-skin metal roof, no ceiling (shed / demountable)
-    'some': 1.0,   # ceiling with thin batts (~R1)
-    'lots': 0.3,   # ceiling with thick batts (~R3.5)
+    'none': 2.5,   # plasterboard ceiling only
+    'some': 0.8,   # ceiling with thin batts (~R1)
+    'lots': 0.28,  # ceiling with thick batts (~R3.5)
 }
 
 
 class House(object):
     """
-    Geometry and construction of a simple single-storey house. Everything except the roof paint
-    lives here, so two houses built from the same House differ only in their roof.
+    Geometry and construction of a simple single-storey house with a gable roof over a square
+    floor plan. Everything except the roof paint lives here, so two houses built from the same
+    House differ only in their roof.
     """
     def __init__(self,
                  floor_area=100.0,          # m²
@@ -72,10 +81,13 @@ class House(object):
                  window_area=15.0,          # m²
                  window_U=5.8,              # W/(m²·K), single glazing
                  window_solar_factor=0.05,  # W of indoor gain per (W/m² GHI) per m² window (shaded windows)
-                 air_changes_per_hour=1.0,  # 1/h
+                 air_changes_per_hour=1.0,  # house ventilation, 1/h
                  internal_gains=400.0,      # W (people, appliances)
-                 insulation='some',         # key of INSULATION, or a roof U-value in W/(m²·K)
+                 insulation='some',         # key of INSULATION, or a ceiling U-value in W/(m²·K)
+                 roof_attic_U=6.0,          # W/(m²·K) per m² roof: roofing + underside convection/radiation
+                 attic_air_changes_per_hour=1.0,  # attic ventilation, 1/h
                  roof_heat_capacity=10e3,   # J/(m²·K) per m² roof (outer roofing layer)
+                 attic_heat_capacity=5e3,   # J/(m²·K) per m² floor (attic air, trusses, top of ceiling)
                  interior_heat_capacity=60e3):  # J/(m²·K) per m² floor (air, furniture, linings)
         self.floor_area = floor_area
         self.roof_pitch = roof_pitch
@@ -87,14 +99,16 @@ class House(object):
         self.air_changes_per_hour = air_changes_per_hour
         self.internal_gains = internal_gains
         self.insulation = insulation
+        self.roof_attic_U = roof_attic_U
+        self.attic_air_changes_per_hour = attic_air_changes_per_hour
         self.roof_heat_capacity = roof_heat_capacity
+        self.attic_heat_capacity = attic_heat_capacity
         self.interior_heat_capacity = interior_heat_capacity
 
+    # ---------- geometry ----------
     @property
-    def roof_U(self):
-        if isinstance(self.insulation, str):
-            return INSULATION[self.insulation]
-        return float(self.insulation)
+    def side(self):
+        return np.sqrt(self.floor_area)
 
     @property
     def roof_area(self):
@@ -105,22 +119,50 @@ class House(object):
         return self.floor_area * self.wall_height
 
     @property
+    def attic_volume(self):
+        """Gable attic over a square floor: triangular prism."""
+        ridge_height = (self.side / 2) * np.tan(np.deg2rad(self.roof_pitch))
+        return 0.5 * self.floor_area * ridge_height
+
+    @property
     def wall_area(self):
-        side = np.sqrt(self.floor_area)
-        return 4 * side * self.wall_height - self.window_area
+        return 4 * self.side * self.wall_height - self.window_area
 
     @property
     def roof_char_length(self):
         """L = area / perimeter of one roof slope (used for size-aware convection)."""
-        side = np.sqrt(self.floor_area)
-        slope = (side / 2) / np.cos(np.deg2rad(self.roof_pitch))
-        return (side * slope) / (2 * (side + slope))
+        slope = (self.side / 2) / np.cos(np.deg2rad(self.roof_pitch))
+        return (self.side * slope) / (2 * (self.side + slope))
+
+    # ---------- conductances (W/K) ----------
+    @property
+    def ceiling_U(self):
+        if isinstance(self.insulation, str):
+            return INSULATION[self.insulation]
+        return float(self.insulation)
+
+    @property
+    def K_roof_attic(self):
+        return self.roof_attic_U * self.roof_area
+
+    @property
+    def K_attic_vent(self):
+        return RHO_CP_AIR * self.attic_volume * self.attic_air_changes_per_hour / 3600.0
+
+    @property
+    def K_ceiling(self):
+        return self.ceiling_U * self.floor_area
 
     @property
     def K_ambient(self):
-        """Conductance from indoor air to outdoor air via walls, windows and ventilation, W/K."""
+        """Indoor air -> outdoor air via walls, windows and house ventilation."""
         ventilation = RHO_CP_AIR * self.volume * self.air_changes_per_hour / 3600.0
         return self.wall_U * self.wall_area + self.window_U * self.window_area + ventilation
+
+    # ---------- heat capacities (J/K) ----------
+    @property
+    def C_attic(self):
+        return self.attic_heat_capacity * self.floor_area
 
     @property
     def C_in(self):
@@ -162,7 +204,7 @@ class RoofedHouse(object):
         self.radht.update_surface_cache()
 
     # ---------- fluxes ----------
-    def roof_fluxes(self, T_roof, T_in, T_amb, ghi, humidity, windspeed, cloud_cover=0.0):
+    def roof_fluxes(self, T_roof, T_attic, T_amb, ghi, humidity, windspeed, cloud_cover=0.0):
         """Individual heat flows INTO the roof surface, W per m² of roof."""
         s = self.surface
         solar = (1 - s.solar_reflectivity) * max(ghi, 0.0)
@@ -170,30 +212,38 @@ class RoofedHouse(object):
                                cloud_cover=cloud_cover, ghi=ghi)
         convective = Model.Pconvection(T_amb, T_roof, windspeed, tilt=s.tilt, model=s.convection_model,
                                        char_length=s.char_length, boundary_layer=s.boundary_layer)
-        from_inside = self.house.roof_U * (T_in - T_roof)
-        return dict(solar=solar, radiative=radiative, convective=convective, from_inside=from_inside)
+        from_attic = self.house.roof_attic_U * (T_attic - T_roof)
+        return dict(solar=solar, radiative=radiative, convective=convective, from_attic=from_attic)
 
-    def _T_in_steady(self, T_roof, T_amb, ghi):
+    def _attic_and_indoor_steady(self, T_roof, T_amb, ghi):
+        """Given the roof temperature, the attic and indoor nodes are linear: solve the 2x2 system."""
         h = self.house
-        UA = h.roof_U * h.roof_area
-        return (UA * T_roof + h.K_ambient * T_amb + h.gains(ghi)) / (UA + h.K_ambient)
+        Kra, Kav, Kc, Ka = h.K_roof_attic, h.K_attic_vent, h.K_ceiling, h.K_ambient
+        A = np.array([[Kra + Kav + Kc, -Kc],
+                      [-Kc, Kc + Ka]])
+        b = np.array([Kra * T_roof + Kav * T_amb,
+                      Ka * T_amb + h.gains(ghi)])
+        T_attic, T_in = np.linalg.solve(A, b)
+        return T_attic, T_in
 
     # ---------- steady state ----------
     def steady_state(self, T_amb, ghi, humidity=50.0, windspeed=2.0, cloud_cover=0.0):
         """
-        Equilibrium roof and indoor temperatures for constant weather.
+        Equilibrium roof, attic and indoor temperatures for constant weather.
         This is the 'if the sun stayed like this all day' answer: good for the roof, but it
         overstates the indoor temperature because it ignores the house's thermal mass.
         """
         def net(T_roof):
-            T_in = self._T_in_steady(T_roof, T_amb, ghi)
-            return sum(self.roof_fluxes(T_roof, T_in, T_amb, ghi, humidity, windspeed, cloud_cover).values())
+            T_attic, _ = self._attic_and_indoor_steady(T_roof, T_amb, ghi)
+            return sum(self.roof_fluxes(T_roof, T_attic, T_amb, ghi, humidity, windspeed, cloud_cover).values())
 
         T_roof = brentq(net, T_amb - 60.0, T_amb + 120.0, xtol=1e-4)
-        T_in = self._T_in_steady(T_roof, T_amb, ghi)
-        fluxes = self.roof_fluxes(T_roof, T_in, T_amb, ghi, humidity, windspeed, cloud_cover)
-        return dict(T_roof=T_roof, T_in=T_in, T_amb=T_amb,
-                    roof_heat_into_house_W=self.house.roof_U * self.house.roof_area * (T_roof - T_in),
+        T_attic, T_in = self._attic_and_indoor_steady(T_roof, T_amb, ghi)
+        fluxes = self.roof_fluxes(T_roof, T_attic, T_amb, ghi, humidity, windspeed, cloud_cover)
+        h = self.house
+        return dict(T_roof=T_roof, T_attic=T_attic, T_in=T_in, T_amb=T_amb,
+                    ceiling_heat_into_house_W=h.K_ceiling * (T_attic - T_in),
+                    attic_vent_heat_removed_W=h.K_attic_vent * (T_attic - T_amb),
                     **{f'flux_{k}': v for k, v in fluxes.items()})
 
     # ---------- transient ----------
@@ -202,7 +252,7 @@ class RoofedHouse(object):
         Transient simulation driven by a weather DataFrame indexed by hours (float) with columns
         'T_amb' (°C), 'ghi' (W/m²), 'humidity' (%), 'windspeed' (m/s) and optionally 'cloud_cover'.
         The weather is repeated for `spinup_days` beforehand so the result is a periodic steady state.
-        Returns a DataFrame with T_roof, T_in and the roof heat flow into the house.
+        Returns a DataFrame with T_roof, T_attic, T_in and the ceiling heat flow into the house.
         """
         t_h = np.asarray(weather.index, dtype=float)
         period = t_h[-1] - t_h[0]
@@ -215,20 +265,21 @@ class RoofedHouse(object):
             return {c: float(np.interp(tt, t_h, v)) for c, v in cols.items()}
 
         h = self.house
-        C_roof = h.roof_heat_capacity
 
         def rhs(t_s, y):
-            T_roof, T_in = y
+            T_roof, T_attic, T_in = y
             w = wx(t_s / 3600.0)
-            f = self.roof_fluxes(T_roof, T_in, w['T_amb'], w['ghi'], w['humidity'], w['windspeed'], w['cloud_cover'])
-            dT_roof = sum(f.values()) / C_roof
-            q_roof = h.roof_U * h.roof_area * (T_roof - T_in)
-            dT_in = (q_roof + h.K_ambient * (w['T_amb'] - T_in) + h.gains(w['ghi'])) / h.C_in
-            return [dT_roof, dT_in]
+            f = self.roof_fluxes(T_roof, T_attic, w['T_amb'], w['ghi'], w['humidity'], w['windspeed'], w['cloud_cover'])
+            dT_roof = sum(f.values()) / h.roof_heat_capacity
+            q_ceiling = h.K_ceiling * (T_attic - T_in)
+            dT_attic = (h.K_roof_attic * (T_roof - T_attic) + h.K_attic_vent * (w['T_amb'] - T_attic)
+                        - q_ceiling) / h.C_attic
+            dT_in = (q_ceiling + h.K_ambient * (w['T_amb'] - T_in) + h.gains(w['ghi'])) / h.C_in
+            return [dT_roof, dT_attic, dT_in]
 
         if T0 is None:
-            w0 = wx(t_h[0])
-            T0 = [w0['T_amb'], w0['T_amb']]
+            T_amb0 = wx(t_h[0])['T_amb']
+            T0 = [T_amb0, T_amb0, T_amb0]
         t_start = (t_h[0] - spinup_days * period) * 3600.0
         t_eval = t_h * 3600.0
         sol = solve_ivp(rhs, (t_start, t_eval[-1]), T0, t_eval=t_eval, method='LSODA',
@@ -236,9 +287,8 @@ class RoofedHouse(object):
         if not sol.success:
             raise RuntimeError(sol.message)
         out = weather.copy()
-        out['T_roof'] = sol.y[0]
-        out['T_in'] = sol.y[1]
-        out['roof_heat_into_house_W'] = h.roof_U * h.roof_area * (out['T_roof'] - out['T_in'])
+        out['T_roof'], out['T_attic'], out['T_in'] = sol.y
+        out['ceiling_heat_into_house_W'] = h.K_ceiling * (out['T_attic'] - out['T_in'])
         return out
 
 
