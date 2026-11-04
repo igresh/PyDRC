@@ -250,12 +250,15 @@ class RoofedHouse(object):
                     **{f'flux_{k}': v for k, v in fluxes.items()})
 
     # ---------- transient ----------
-    def simulate(self, weather, T0=None, spinup_days=2):
+    def simulate(self, weather, T0=None, spinup_days=2, ac=None):
         """
         Transient simulation driven by a weather DataFrame indexed by hours (float) with columns
         'T_amb' (°C), 'ghi' (W/m²), 'humidity' (%), 'windspeed' (m/s) and optionally 'cloud_cover'.
         The weather is repeated for `spinup_days` beforehand so the result is a periodic steady state.
-        Returns a DataFrame with T_roof, T_attic, T_in and the ceiling heat flow into the house.
+        ac: optional AirConditioner. When given, it removes heat from the indoor node to hold
+            T_in at its setpoint (cooling only, limited by its capacity).
+        Returns a DataFrame with T_roof, T_attic, T_in and the ceiling heat flow into the house,
+        plus Q_cool_W, COP and P_elec_W when ac is given.
         """
         t_h = np.asarray(weather.index, dtype=float)
         period = t_h[-1] - t_h[0]
@@ -277,7 +280,8 @@ class RoofedHouse(object):
             q_ceiling = h.K_ceiling * (T_attic - T_in)
             dT_attic = (h.K_roof_attic * (T_roof - T_attic) + h.K_attic_vent * (w['T_amb'] - T_attic)
                         - q_ceiling) / h.C_attic
-            dT_in = (q_ceiling + h.K_ambient * (w['T_amb'] - T_in) + h.gains(w['ghi'])) / h.C_in
+            q_cool = ac.cooling(T_in) if ac is not None else 0.0
+            dT_in = (q_ceiling + h.K_ambient * (w['T_amb'] - T_in) + h.gains(w['ghi']) - q_cool) / h.C_in
             return [dT_roof, dT_attic, dT_in]
 
         if T0 is None:
@@ -292,7 +296,53 @@ class RoofedHouse(object):
         out = weather.copy()
         out['T_roof'], out['T_attic'], out['T_in'] = sol.y
         out['ceiling_heat_into_house_W'] = h.K_ceiling * (out['T_attic'] - out['T_in'])
+        if ac is not None:
+            out['Q_cool_W'] = [ac.cooling(T) for T in out['T_in']]
+            out['COP'] = [ac.cop(T_amb) for T_amb in out['T_amb']]
+            out['P_elec_W'] = out['Q_cool_W'] / out['COP']
         return out
+
+
+class AirConditioner(object):
+    """
+    An idealised cooling-only split/ducted system with a thermostat.
+
+    Thermostat: an ideal (high-gain proportional) controller that removes just enough heat to hold
+    the indoor air at `setpoint`, up to `capacity_W`. It never heats.
+
+    Efficiency: COP = carnot_fraction × Carnot COP between an evaporator `evap_approach` K below the
+    setpoint and a condenser `cond_approach` K above the outdoor air, capped at `cop_max`.
+    With the defaults this gives COP ≈ 3.4 at 35 °C outside / 23 °C inside, typical of a modern
+    Australian inverter system, falling as it gets hotter outside.
+    """
+    def __init__(self, setpoint=23.0, capacity_W=8000.0, carnot_fraction=0.4,
+                 evap_approach=10.0, cond_approach=12.0, cop_max=6.0, gain_W_per_K=20000.0):
+        self.setpoint = setpoint
+        self.capacity_W = capacity_W            # cooling capacity; ~80 W/m² for a 100 m² house
+        self.carnot_fraction = carnot_fraction
+        self.evap_approach = evap_approach
+        self.cond_approach = cond_approach
+        self.cop_max = cop_max
+        self.gain_W_per_K = gain_W_per_K
+
+    def cooling(self, T_in):
+        """Heat removed from the indoor air, W."""
+        return float(np.clip(self.gain_W_per_K * (T_in - self.setpoint), 0.0, self.capacity_W))
+
+    def cop(self, T_amb):
+        T_evap = self.setpoint - self.evap_approach + 273.15
+        T_cond = T_amb + self.cond_approach + 273.15
+        lift = max(T_cond - T_evap, 1.0)
+        return float(min(self.cop_max, self.carnot_fraction * T_evap / lift))
+
+
+def energy_summary(result):
+    """Daily totals from a simulate(..., ac=...) result: kWh of heat removed and of electricity used."""
+    trapz = getattr(np, 'trapezoid', None) or np.trapz  # numpy >= 2 renamed trapz
+    hours = np.asarray(result.index, dtype=float)
+    return dict(cooling_kWh=float(trapz(result['Q_cool_W'], hours)) / 1000.0,
+                electricity_kWh=float(trapz(result['P_elec_W'], hours)) / 1000.0,
+                peak_electric_kW=float(result['P_elec_W'].max()) / 1000.0)
 
 
 def daily_weather(T_max=32.0, daily_range=10.0, ghi_peak=1000.0, humidity=50.0, windspeed=2.0,
