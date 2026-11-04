@@ -32,6 +32,7 @@ Indoor air (W):
 
 P_rad and h_c come straight from Model.ThermalHeatTransfer and Model.Pconvection.
 The insulation sits on the ceiling (between attic and house), not under the roof sheeting.
+Attic ventilation defaults to 5 air changes per hour (a mid-range Australian roof space).
 
 Simplifications (deliberate, for a clear "same house, different roof" comparison):
   * Irradiance on the roof is taken as GHI (a pitched roof's two slopes roughly average to this).
@@ -85,7 +86,9 @@ class House(object):
                  internal_gains=400.0,      # W (people, appliances)
                  insulation='some',         # key of INSULATION, or a ceiling U-value in W/(m²·K)
                  roof_attic_U=6.0,          # W/(m²·K) per m² roof: roofing + underside convection/radiation
-                 attic_air_changes_per_hour=1.0,  # attic ventilation, 1/h
+                 attic_air_changes_per_hour=5.0,  # attic ventilation, 1/h. Typical Australian roof spaces:
+                                                  # ~1-3 sarked metal / sealed eaves, ~3-5 vented metal or
+                                                  # sarked tiles, ~10-20+ unsarked tiles or whirlybirds.
                  roof_heat_capacity=10e3,   # J/(m²·K) per m² roof (outer roofing layer)
                  attic_heat_capacity=5e3,   # J/(m²·K) per m² floor (attic air, trusses, top of ceiling)
                  interior_heat_capacity=60e3):  # J/(m²·K) per m² floor (air, furniture, linings)
