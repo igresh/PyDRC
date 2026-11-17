@@ -1,3 +1,15 @@
+"""
+PyDRC: Passive Daytime Radiative Cooling & Atmospheric Water Capture Simulator.
+
+Theoretical Lineage:
+    The coupled transient energy-and-mass-balance formulation (SurfaceSimulator,
+    deriv_m, VPsat) is built on the Nikolayev & Beysens (1996) and Vuollekoski
+    et al. (2015, Hydrol. Earth Syst. Sci. 19, 601-613) dew-condensation model,
+    extended to full 24-hour diurnal operation with spectrally resolved long-wave
+    radiative transfer, tilted-plane solar optics, mixed natural/forced
+    convection, and substrate conduction.
+"""
+
 import inspect
 import warnings
 import numpy as np
