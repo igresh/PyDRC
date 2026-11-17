@@ -144,11 +144,33 @@ print(f"Equilibrium T_surf - T_amb: {delta_T:+.2f} °C")
 
 ---
 
-## Citation
+## Theoretical Basis & Model Lineage
+
+The coupled transient energy-and-mass balance in `PyDRC` builds directly upon the classic **Nikolayev & Beysens (1996)** and **Vuollekoski et al. (2015)** physical dew-condensation formulation:
+
+* **Shared Governing Framework:**
+  * Coupled transient ODEs for substrate temperature $T_s$ and condensed water mass $m$ (`SurfaceSimulator._derivs`), dynamically incorporating the thermal mass of the accumulated water film ($C_{\text{panel}} + c_{p,w} m$).
+  * Bulk aerodynamic mass transfer (`deriv_m`) via the Chilton–Colburn / Lewis heat–mass analogy ($\text{Le} \approx 1$), driven by the vapor pressure deficit between ambient dew point and the condenser surface using the Buck (1981) saturation vapor pressure equation (`VPsat`).
+* **Extensions Beyond the Broadband Nocturnal Formulation:**
+  * **Spectrally Resolved Long-Wave Transfer:** Replaces broadband grey-body sky correlations with wavelength-resolved Planck integration across `libRadtran`-calibrated clear/cloudy atmospheric bands (`ThermalHeatTransfer`, `spectral_humidCorr`), enabling modeling of spectrally selective emitters.
+  * **Full Diurnal Solar Optics:** Adds daytime solar decomposition (`erbs_australia`), anisotropic tilted-plane transposition (`pvlib`), Martin & Ruiz angle-of-incidence modifiers, and bezel shading (`calculate_plane_of_array_irradiance`).
+  * **Ground Radiation, Rear Conduction & Mixed Convection:** Explicitly resolves tilted-plane sky view factor and solar-heated ground/roof temperature (`ground_temperature`), rear insulation conduction (`Pconduction`), directional wind sheltering (`calculate_effective_wind_speed`), and size-/tilt-dependent `Combined-TARP-*` mixed convection (`get_tarp_natural_convection`).
+  * **Continuous Runoff / Drainage:** Clamps vapor transfer to condensation when $T_s \le T_{\text{dew}}$ and models continuous gravitational drainage off tilted panels (`SurfaceSimulator._derivs`).
+
+---
+
+## Citation & References
 
 If you use `PyDRC` in your research, please cite:
 
 > Chiu, M., Theau, E., Harrison, A., de Sterke, C. M., Alexander, T. J., & Neto, C. (2025). *Passively Cooled Paint-Like Coatings for Atmospheric Water Capture*. **Advanced Functional Materials**, 36(19), 2519108. https://doi.org/10.1002/adfm.202519108
+
+### Foundational Modeling References
+The thermodynamic and mass-transfer backbone of `PyDRC` is based on the Beysens / Nikolayev and Vuollekoski dew-harvesting formulation:
+
+* Nikolayev, V. S., Beysens, D., Gioda, A., Milimouk, I., Katiushin, E., & Morel, J.-P. (1996). Water recovery from dew. *Journal of Hydrology*, 182(1–4), 19–35. https://doi.org/10.1016/0022-1694(95)02939-7
+* Beysens, D., Milimouk, I., Nikolayev, V. S., Berkowicz, S., Muselli, M., Heusinkveld, B., & Jacobs, A. F. G. (2006). Comment on "The moisture from the air as water resource in arid region: Hopes, doubt and facts" by Kogan and Trahtman. *Journal of Arid Environments*, 67(2), 343–352. https://doi.org/10.1016/j.jaridenv.2006.01.011
+* Vuollekoski, H., Vogt, M., Sinclair, V. A., Duplissy, J., Järvinen, H., Kyrö, E.-M., Makkonen, R., Petäjä, T., Prisle, N. L., Räisänen, P., Sipilä, M., Ylhäisi, J., & Kulmala, M. (2015). Estimates of global dew collection potential on artificial surfaces. *Hydrology and Earth System Sciences*, 19(1), 601–613. https://doi.org/10.5194/hess-19-601-2015
 
 ---
 
